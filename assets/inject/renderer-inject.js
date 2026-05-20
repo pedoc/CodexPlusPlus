@@ -940,10 +940,6 @@
     `;
   }
 
-  function cacheBustCodexPlusAdUrl(url, version) {
-    return `${url}${url.includes("?") ? "&" : "?"}v=${version}`;
-  }
-
   async function directFetchCodexPlusAds() {
     return { version: 1, ads: [] };
   }
