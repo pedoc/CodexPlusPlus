@@ -4,7 +4,7 @@ use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -16,15 +16,36 @@ pub enum ZedRemoteError {
     StateRead(#[source] std::io::Error),
     #[error("Cannot parse Codex remote connection state")]
     StateParse(#[source] serde_json::Error),
+    #[error("Cannot read Codex++ Zed remote project registry")]
+    RegistryRead(#[source] std::io::Error),
+    #[error("Cannot parse Codex++ Zed remote project registry")]
+    RegistryParse(#[source] serde_json::Error),
+    #[error("Cannot write Codex++ Zed remote project registry")]
+    RegistryWrite(#[source] std::io::Error),
     #[error("Failed to launch Zed: {0}")]
     Launch(std::io::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTarget {
     pub user: String,
     pub host: String,
     pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ZedOpenStrategy {
+    AddToFocusedWorkspace,
+    ReuseWindow,
+    NewWindow,
+    Default,
+}
+
+impl Default for ZedOpenStrategy {
+    fn default() -> Self {
+        Self::AddToFocusedWorkspace
+    }
 }
 
 pub fn candidate_zed_app_paths() -> Vec<PathBuf> {
@@ -277,11 +298,39 @@ fn percent_encode_segment(segment: &str) -> String {
     encoded
 }
 
-pub fn launch_zed_url(url: &str) -> Result<(), ZedRemoteError> {
-    let app_path = find_zed_app_path();
+pub fn zed_cli_args_for_strategy(strategy: ZedOpenStrategy, url: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    match strategy {
+        ZedOpenStrategy::AddToFocusedWorkspace => args.push("-a".to_string()),
+        ZedOpenStrategy::ReuseWindow => args.push("-r".to_string()),
+        ZedOpenStrategy::NewWindow => args.push("-n".to_string()),
+        ZedOpenStrategy::Default => {}
+    }
+    args.push(url.to_string());
+    args
+}
+
+pub fn zed_open_strategy_from_payload(payload: &Value) -> ZedOpenStrategy {
+    payload
+        .get("strategy")
+        .and_then(|value| serde_json::from_value::<ZedOpenStrategy>(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+pub fn launch_zed_url_with_strategy(
+    url: &str,
+    strategy: ZedOpenStrategy,
+) -> Result<(), ZedRemoteError> {
     let cli_path = find_zed_cli_path();
+    if !cli_path.is_empty() {
+        Command::new(cli_path)
+            .args(zed_cli_args_for_strategy(strategy, url))
+            .spawn()
+            .map_err(ZedRemoteError::Launch)?;
+        return Ok(());
+    }
     if cfg!(target_os = "macos") {
-        if let Some(app_path) = app_path {
+        if let Some(app_path) = find_zed_app_path() {
             Command::new("open")
                 .arg("-a")
                 .arg(app_path)
@@ -291,24 +340,17 @@ pub fn launch_zed_url(url: &str) -> Result<(), ZedRemoteError> {
             return Ok(());
         }
     }
-    if !cli_path.is_empty() {
-        Command::new(cli_path)
-            .arg(url)
-            .spawn()
-            .map_err(ZedRemoteError::Launch)?;
-        return Ok(());
-    }
     Err(ZedRemoteError::Validation(
-        "Zed is not installed or not available on PATH",
+        "Zed CLI is not installed or not available on PATH",
     ))
 }
 
+pub fn launch_zed_url(url: &str) -> Result<(), ZedRemoteError> {
+    launch_zed_url_with_strategy(url, ZedOpenStrategy::Default)
+}
+
 pub fn codex_global_state_path() -> PathBuf {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home_dir().map(|home| home.join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
-        .join(".codex-global-state.json")
+    crate::codex_home::default_codex_home_dir().join(".codex-global-state.json")
 }
 
 pub fn target_from_managed_remote_connection(
@@ -365,6 +407,9 @@ pub fn resolve_ssh_target_for_host_id(
     host_id: &str,
     state_path: Option<&Path>,
 ) -> Result<SshTarget, ZedRemoteError> {
+    if host_id.is_empty() {
+        return Err(ZedRemoteError::Validation("Remote host id is required"));
+    }
     let path = state_path
         .map(Path::to_path_buf)
         .unwrap_or_else(codex_global_state_path);
@@ -373,83 +418,18 @@ pub fn resolve_ssh_target_for_host_id(
     resolve_ssh_target_from_global_state(&state, host_id)
 }
 
-pub fn ordered_remote_projects_from_global_state(state: &Value) -> Vec<Value> {
-    let projects = state
-        .get("remote-projects")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|project| project.as_object().is_some())
-        .collect::<Vec<_>>();
-    let project_order = state
-        .get("project-order")
-        .and_then(Value::as_array)
-        .map(|order| {
-            order
-                .iter()
-                .map(|item| string_value(Some(item)))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let mut ordered = Vec::new();
-    for project_id in project_order {
-        if let Some(project) = projects
-            .iter()
-            .find(|project| string_value(project.get("id")) == project_id)
-        {
-            ordered.push(project.clone());
-        }
-    }
-    let ordered_ids = ordered
-        .iter()
-        .map(|project| string_value(project.get("id")))
-        .collect::<std::collections::HashSet<_>>();
-    ordered.extend(
-        projects
-            .into_iter()
-            .filter(|project| !ordered_ids.contains(&string_value(project.get("id")))),
-    );
-    ordered
-}
+mod fallback;
+mod registry;
 
-pub fn fallback_open_request_from_global_state(state: &Value) -> Result<Value, ZedRemoteError> {
-    let selected_host_id = string_value(state.get("selected-remote-host-id"));
-    let selected_project = ordered_remote_projects_from_global_state(state)
-        .into_iter()
-        .find(|project| {
-            let project_host_id = string_value(project.get("hostId"));
-            let remote_path = string_value(project.get("remotePath"));
-            (selected_host_id.is_empty() || project_host_id == selected_host_id)
-                && remote_path.starts_with('/')
-        })
-        .ok_or(ZedRemoteError::Validation(
-            "Cannot determine remote workspace or file for Zed",
-        ))?;
-    let host_id =
-        selected_host_id.or_else_nonempty(|| string_value(selected_project.get("hostId")));
-    if host_id.is_empty() {
-        return Err(ZedRemoteError::Validation("Remote host id is required"));
-    }
-    let target = resolve_ssh_target_from_global_state(state, &host_id)?;
-    Ok(json!({
-        "hostId": host_id,
-        "ssh": { "user": target.user, "host": target.host, "port": target.port },
-        "path": string_value(selected_project.get("remotePath")),
-    }))
-}
-
-pub fn fallback_open_request_response(_payload: &Value) -> Value {
-    let path = codex_global_state_path();
-    let result = fs::read_to_string(path)
-        .map_err(ZedRemoteError::StateRead)
-        .and_then(|data| serde_json::from_str::<Value>(&data).map_err(ZedRemoteError::StateParse))
-        .and_then(|state| fallback_open_request_from_global_state(&state));
-    match result {
-        Ok(request) => json!({"status": "ok", "request": request}),
-        Err(error) => json!({"status": "failed", "message": error.to_string()}),
-    }
-}
+pub use fallback::{
+    fallback_open_request_from_global_state_with_context, fallback_open_request_response,
+    workspace_root_from_sqlite,
+};
+pub use registry::{
+    ZedRemoteProject, ZedRemoteProjectSource, forget_zed_remote_project_response,
+    list_zed_remote_projects_from_state, list_zed_remote_projects_response,
+    remember_zed_remote_project_response,
+};
 
 pub fn resolve_ssh_target_response(payload: &Value) -> Value {
     let host_id = string_value(payload.get("hostId"));
@@ -463,14 +443,22 @@ pub fn resolve_ssh_target_response(payload: &Value) -> Value {
 }
 
 pub fn open_zed_remote(payload: &Value) -> Value {
+    let strategy = zed_open_strategy_from_payload(payload);
     let result = target_from_payload(payload).and_then(|target| {
         let path = string_value(payload.get("path"));
         let url = build_zed_remote_url(&target, &path)?;
-        launch_zed_url(&url)?;
+        launch_zed_url_with_strategy(&url, strategy)?;
+        if payload
+            .get("remember")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            let _ = registry::remember_zed_remote_project(payload, Some(&target), Some(&url));
+        }
         Ok(url)
     });
     match result {
-        Ok(url) => json!({"status": "ok", "url": url}),
+        Ok(url) => json!({"status": "ok", "url": url, "strategy": strategy}),
         Err(error) => json!({"status": "failed", "message": error.to_string()}),
     }
 }

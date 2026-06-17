@@ -1,11 +1,17 @@
+use base64::Engine;
 use codex_plus_core::assets;
 use codex_plus_core::bridge::{self, BRIDGE_BINDING_NAME};
-use codex_plus_core::cdp::{CdpTarget, pick_page_target};
+use codex_plus_core::cdp::{
+    CdpTarget, list_targets, pick_injectable_codex_page_target, pick_page_target,
+};
+
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::future::Future;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -45,6 +51,41 @@ fn injection_script_prefixes_helper_url_and_sponsor_images() {
     assert!(script.contains(codex_plus_core::version::VERSION));
     assert!(script.contains("https://discord.gg/y96kX7A76v"));
     assert!(script.contains("data-codex-plus-discord"));
+}
+
+#[test]
+fn injection_script_exposes_image_overlay_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("overlay.png");
+    std::fs::write(
+        &image_path,
+        base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+            .unwrap(),
+    )
+    .unwrap();
+    let settings = codex_plus_core::settings::BackendSettings {
+        codex_app_image_overlay_enabled: true,
+        codex_app_image_overlay_path: image_path.to_string_lossy().to_string(),
+        codex_app_image_overlay_opacity: 42,
+        ..Default::default()
+    };
+    let script = assets::injection_script_with_settings(57321, &settings);
+
+    assert!(script.contains("window.__CODEX_PLUS_IMAGE_OVERLAY__"));
+    assert!(script.contains("\"enabled\":true"));
+    assert!(script.contains("\"opacity\":0.42"));
+    assert!(script.contains("\"dataUrl\":\"data:image/png;base64,"));
+    assert!(script.contains("http://127.0.0.1:57321/overlay/image"));
+}
+
+#[test]
+fn injection_script_installs_image_overlay_from_data_uri() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("const source = config.dataUrl || \"\""));
+    assert!(script.contains("image.src = source"));
+    assert!(script.contains("image_overlay_installed"));
 }
 
 #[test]
@@ -89,6 +130,19 @@ fn injection_script_explains_plugin_patch_is_unneeded_in_relay_mode() {
 }
 
 #[test]
+fn injection_script_menu_exposes_three_independent_plugin_switches() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("插件市场解锁"));
+    assert!(script.contains("data-codex-plus-setting=\"pluginMarketplaceUnlock\""));
+    assert!(script.contains("强制解锁入口"));
+    assert!(script.contains("data-codex-plus-setting=\"pluginEntryUnlock\""));
+    assert!(script.contains("特殊插件强制安装"));
+    assert!(script.contains("data-codex-plus-setting=\"forcePluginInstall\""));
+    assert!(script.contains("恢复 1.1.9 的入口解锁方式"));
+}
+
+#[test]
 fn injection_script_skips_plugin_patch_work_in_relay_mode() {
     let script = assets::injection_script(57321);
 
@@ -96,6 +150,59 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
     assert!(script.contains("!codexPlusBackendSettingsLoaded"));
     assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
     assert!(script.contains("clearPluginPatchArtifacts()"));
+}
+
+#[test]
+fn injection_script_defines_version_gated_plugin_unlock_strategy() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("codexPluginLegacyEntryUnlockBeforeVersion = \"26.601.2237\""));
+    assert!(script.contains("function parseCodexVersionParts(version)"));
+    assert!(script.contains("function compareCodexVersions(left, right)"));
+    assert!(script.contains("function codexPluginUnlockStrategy()"));
+    assert!(script.contains("const comparison = compareCodexVersions(version, codexPluginLegacyEntryUnlockBeforeVersion)"));
+    assert!(script.contains("return comparison < 0 ? \"legacy\" : \"modern\""));
+}
+
+#[test]
+fn injection_script_gates_legacy_and_modern_plugin_unlock_by_codex_version() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("const pluginUnlockStrategy = codexPluginUnlockStrategy()"));
+    assert!(script.contains("if ((pluginUnlockStrategy === \"legacy\" || pluginUnlockStrategy === \"unknown\") && settings.pluginEntryUnlock)"));
+    assert!(script.contains("if ((pluginUnlockStrategy === \"modern\" || pluginUnlockStrategy === \"unknown\") && settings.pluginMarketplaceUnlock)"));
+    assert!(script.contains("plugin_unlock_strategy_selected"));
+    assert!(script.contains("window.__codexPluginUnlockStrategyLogged"));
+}
+
+#[test]
+fn injection_script_restores_legacy_plugin_sidebar_entry_unlock() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("pluginEntryUnlock: true"));
+    assert!(script.contains("pluginEntryUnlock: \"codexAppPluginEntryUnlock\""));
+    assert!(script.contains("function reactFiberFrom(element)"));
+    assert!(script.contains("function authContextValueFrom(element)"));
+    assert!(script.contains("function spoofChatGPTAuthMethod(element)"));
+    assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
+    assert!(script.contains("function pluginEntryButton()"));
+    assert!(script.contains("function enablePluginEntry()"));
+    assert!(script.contains("if (!codexPlusSettings().pluginEntryUnlock) return"));
+    assert!(script.contains("pluginButton.addEventListener(\"click\", () => {"));
+    assert!(script.contains("spoofChatGPTAuthMethod(pluginButton);"));
+    assert!(script.contains("插件 - 已解锁"));
+    assert!(script.contains("Plugins - Unlocked"));
+}
+
+#[test]
+fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("pluginMarketplaceUnlock: true"));
+    assert!(script.contains("pluginMarketplaceUnlock: \"codexAppPluginMarketplaceUnlock\""));
+    assert!(script.contains("if (!codexPlusSettings().pluginMarketplaceUnlock) return"));
+    assert!(script.contains("installPluginBuildFlavorFilterPatch"));
+    assert!(script.contains("installPluginMarketplaceRequestPatch"));
 }
 
 #[test]
@@ -109,6 +216,98 @@ fn injection_script_unlocks_nested_disabled_plugin_install_buttons() {
     assert!(script.contains("props[\"data-disabled\"] = undefined"));
     assert!(script.contains("button.querySelectorAll?.(\"button, [role='button'], [disabled], [aria-disabled], [data-disabled]"));
     assert!(script.contains("button.dataset.codexForceInstallUnlocked"));
+}
+
+#[test]
+fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"10\""));
+    assert!(script.contains("if (name === \"openai-bundled\") return \"\""));
+    assert!(
+        !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
+    );
+    assert!(script.contains("if (name === \"openai-bundled\" || name === \"codex-plus-openai-bundled\") return \"OpenAI插件1(Codex++)\""));
+}
+
+#[test]
+fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"10\""));
+    assert!(script.contains("isCodexPluginBuildFlavorFilter"));
+    assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
+    assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
+    assert!(!script.contains("if (!source.includes(\"marketplaceName\")) return false"));
+    assert!(!script.contains("if (!source.includes(\"name\")) return false"));
+}
+
+#[test]
+fn injection_script_expands_api_key_plugin_marketplace_requests() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"10\""));
+    assert!(script.contains("installPluginMarketplaceRequestPatch"));
+    assert!(script.contains("installPluginBuildFlavorFilterPatch"));
+    assert!(script.contains("Array.prototype.filter"));
+    assert!(script.contains("codexPluginBuildFlavorFilterPatch"));
+    assert!(script.contains("isCodexPluginBuildFlavorFilter"));
+    assert!(script.contains(
+        "codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin)"
+    ));
+    assert!(script.contains("isCodexPluginMarketplaceHiddenFilter"));
+    assert!(script.contains(
+        "codexPluginOfficialMarketplaceName(marketplace?.name) && !callback(marketplace)"
+    ));
+    assert!(script.contains("plugin_marketplace_hidden_filter_bypassed"));
+    assert!(script.contains("method === \"list-plugins\""));
+    assert!(script.contains("delete next.marketplaceKinds"));
+    assert!(script.contains("patchPluginMarketplaceResult"));
+    assert!(script.contains("pluginMarketplaceAliasForName"));
+    assert!(script.contains("marketplace.name = alias"));
+    assert!(script.contains("restorePluginMarketplaceName"));
+    assert!(script.contains(
+        "next.remoteMarketplaceName = restorePluginMarketplaceName(next.remoteMarketplaceName)"
+    ));
+    assert!(script.contains("if (name === \"openai-bundled\") return \"\""));
+    assert!(
+        script.contains("if (name === \"openai-curated\") return \"codex-plus-openai-curated\"")
+    );
+    assert!(script.contains(
+        "if (name === \"openai-primary-runtime\") return \"codex-plus-openai-primary-runtime\""
+    ));
+    assert!(script.contains("OpenAI插件1(Codex++)"));
+    assert!(script.contains("OpenAI插件2(Codex++)"));
+    assert!(script.contains("OpenAI插件3(Codex++)"));
+    assert!(script.contains("method === \"install-plugin\""));
+    assert!(script.contains("plugin_marketplace_response_expanded"));
+    assert!(script.contains("plugin_build_flavor_filter_bypassed"));
+    assert!(script.contains("plugin_install_request_debug"));
+    assert!(script.contains("plugin_install_request_failed"));
+    assert!(!script.contains("marketplace.path ="));
+    assert!(!script.contains("codexPluginMarketplacePathAliasForName"));
+    assert!(!script.contains("spoofAnyCodexAuthContext"));
+}
+
+#[test]
+fn injection_script_deletes_marketplace_kinds_to_request_default_catalog() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("delete next.marketplaceKinds"));
+    assert!(script.contains("plugin_marketplace_request_expanded"));
+    assert!(!script.contains("codexPluginAllowedMarketplaceKinds"));
+    assert!(!script.contains("codexPluginExpandedMarketplaceKinds"));
+    assert!(!script.contains("next.marketplaceKinds = Array.from(new Set"));
+}
+
+#[test]
+fn injection_script_logs_marketplace_grouping_diagnostics() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("plugin_marketplace_response_debug"));
+    assert!(script.contains("marketplaces: result.marketplaces.map"));
+    assert!(script.contains("pluginMarketplaceCounts"));
+    assert!(script.contains("remoteMarketplaceName"));
 }
 
 #[test]
@@ -153,6 +352,58 @@ fn injection_script_exposes_conversation_view_width_control() {
 }
 
 #[test]
+fn injection_script_keeps_session_action_buttons_in_pr_style() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("actionButtonClass = \"codex-session-action-button\""));
+    assert!(script.contains("background: transparent;"));
+    assert!(script.contains("background: #363839;"));
+    assert!(script.contains("cursor: default;"));
+}
+
+#[test]
+fn injection_script_moves_export_and_project_move_into_more_menu() {
+    let script = assets::injection_script(57321).replace("\r\n", "\n");
+
+    assert!(script.contains("moreButtonClass = \"codex-session-more-button\""));
+    assert!(script.contains("moreMenuClass = \"codex-session-more-menu\""));
+    assert!(script.contains("configureActionButton(moreButton, \"更多操作\", \"…\")"));
+    assert!(script.contains("createSessionMoreMenuItem(\"导出\""));
+    assert!(script.contains("createSessionMoreMenuItem(\"移动\""));
+    assert!(script.contains("group.appendChild(moreButton)"));
+    assert!(script.contains("installMoreButtonEvents(row, moreButton, openMoreMenu)"));
+    assert!(script.contains("installSessionMoreMenuAutoClose(row, moreMenu)"));
+    assert!(script.contains("updateSessionMoreMenuDirection(moreButton, moreMenu)"));
+    assert!(script.contains("positionSessionMoreMenu(moreButton, moreMenu)"));
+    assert!(script.contains("document.body.appendChild(moreMenu)"));
+    assert!(script.contains("position: fixed;"));
+    assert!(script.contains("codex-session-more-menu-open-up"));
+    assert!(script.contains("transform: translateY(calc(-100% - 34px));"));
+    assert!(script.contains("positionSessionMoreMenu(moreButton, moreMenu);"));
+    assert!(script.contains("row.classList.toggle(\"codex-session-more-open\""));
+    assert!(script.contains(".${actionGroupClass} {"));
+    assert!(script.contains("position: absolute;"));
+    assert!(script.contains("pointer-events: none;"));
+    assert!(script.contains("[data-codex-delete-row=\"true\"]:hover .${actionGroupClass} {\n        opacity: 1;\n        pointer-events: auto;\n      }"));
+    assert!(script.contains("[data-codex-delete-row=\"true\"].codex-session-more-open .${actionGroupClass} {\n        opacity: 1;\n        pointer-events: auto;\n        z-index: 2147483201;"));
+    assert!(!script.contains("installActionButtonEvents(row, moreButton, openMoreMenu)"));
+    assert!(!script.contains("group.appendChild(exportButton)"));
+    assert!(!script.contains("group.appendChild(moveButton)"));
+}
+
+#[test]
+fn injection_script_does_not_add_delete_controls_on_archived_page() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("attachArchivedPageDeleteButton"));
+    assert!(script.contains("data-codex-archive-row-action"));
+    assert!(script.contains("dataset.codexArchiveRowAction = \"export\""));
+    assert!(!script.contains("dataset.codexArchiveRowAction = \"delete\""));
+    assert!(!script.contains("installArchivedDeleteAllButton"));
+    assert!(!script.contains("删除全部归档"));
+}
+
+#[test]
 fn injection_script_unlocks_custom_model_catalog() {
     let script = assets::injection_script(57321);
 
@@ -161,9 +412,256 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("patchModelArray"));
     assert!(script.contains("patchStatsigModelDynamicConfig"));
     assert!(script.contains("patchModelJsonResponse"));
+    assert!(script.contains("installAppServerModelRequestPatch"));
+    assert!(script.contains("list-models-for-host"));
+    assert!(script.contains("appServerModelRequestMethod"));
+    assert!(script.contains("send-cli-request-for-host"));
     assert!(script.contains("Response.prototype.json"));
+    assert!(script.contains("scheduleCodexModelWhitelistRefresh"));
+    assert!(script.contains("runCodexModelWhitelistRefreshPass"));
+    assert!(script.contains("model_whitelist_refresh_scheduled"));
     assert!(script.contains("available_models"));
     assert!(script.contains("modelWhitelistUnlock"));
+    assert!(script.contains("isWorkspaceChromeNode"));
+    assert!(script.contains("refreshCodexModelWhitelistFromScan"));
+    assert!(!script.contains("querySelectorAll(\"button, [role='menu']"));
+}
+
+#[test]
+fn injection_script_exposes_fast_service_tier_control() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("default-service-tier"));
+    assert!(script.contains("setting-storage-"));
+    assert!(script.contains("codexAppAssetUrl"));
+    assert!(script.contains("codexThreadServiceTierOverrides"));
+    assert!(script.contains("setCodexThreadServiceTierMode"));
+    assert!(script.contains("codexServiceTierRequestOverride"));
+    assert!(script.contains("codexServiceTierSupportedFastModels"));
+    assert!(script.contains("\"gpt-5.4\""));
+    assert!(script.contains("\"gpt-5.5\""));
+    assert!(script.contains("codexServiceTierFastSupportedForModel"));
+    assert!(script.contains("codexServiceTierModelForRequest"));
+    assert!(script.contains("codexServiceTierMaybeLoadModelCatalog"));
+    assert!(script.contains("fastBlocked"));
+    assert!(script.contains("data-tier=\"unsupported\""));
+    assert!(script.contains("nextParams.service_tier = override.serviceTier"));
+    assert!(script.contains("serviceTierControls: false"));
+    assert!(script.contains("data-codex-plus-setting=\"serviceTierControls\""));
+    assert!(script.contains("data-codex-service-tier-controls"));
+    assert!(script.contains("removeCodexServiceTierBadges"));
+    assert!(script.contains("installCodexServiceTierDispatcherPatch"));
+    assert!(script.contains("服务模式"));
+    assert!(script.contains("data-codex-service-tier-status"));
+    assert!(script.contains("data-codex-service-tier-inherit"));
+    assert!(script.contains("data-codex-service-tier-standard"));
+    assert!(script.contains("data-codex-service-tier-fast"));
+    assert!(script.contains("data-codex-service-tier-custom"));
+    assert!(script.contains("data-codex-service-tier-thread-inherit"));
+    assert!(script.contains("data-codex-service-tier-thread-standard"));
+    assert!(script.contains("data-codex-service-tier-thread-fast"));
+    assert!(script.contains("global-standard"));
+    assert!(script.contains("global-fast"));
+    assert!(script.contains("defaultMode"));
+    assert!(script.contains("codexServiceTierEffectiveThreadMode"));
+    assert!(script.contains("codexServiceTierDefaultModeForControlMode"));
+    assert!(script.contains("normalizeCodexServiceTierControlMode(state.mode) !== \"custom\""));
+    assert!(script.contains("state.draft = null"));
+    assert!(script.contains("后端未连接，无法切换服务模式"));
+    assert!(script.contains("未连接"));
+    assert!(script.contains("thread/start"));
+    assert!(script.contains("thread/resume"));
+    assert!(script.contains("turn/start"));
+    assert!(script.contains("send-cli-request-for-host"));
+    assert!(script.contains("start-conversation"));
+    assert!(script.contains("applyCodexServiceTierRequestOverride(\"thread/start\", message)"));
+    assert!(script.contains("codex-service-tier-badge"));
+    assert!(script.contains("installCodexServiceTierBadge"));
+    assert!(script.contains("toggleCodexServiceTierFromBadge"));
+    assert!(script.contains("wireCodexServiceTierBadge"));
+    assert!(script.contains("codexServiceTierBadgePlacement"));
+    assert!(script.contains("codexServiceTierBadgeFooterGroup"));
+    assert!(script.contains("codexServiceTierFindComposerEl"));
+    assert!(script.contains("codexServiceTierVisibleComposerFooters"));
+    assert!(script.contains("codexServiceTierBestComposerFooter"));
+    assert!(script.contains("codexServiceTierComposerCandidates"));
+    assert!(script.contains("codexServiceTierComposerScore"));
+    assert!(script.contains("data-codex-service-tier-badge"));
+    assert!(script.contains("codexServiceTierBadgeWired"));
+    assert!(script.contains("setAttribute(\"role\", \"button\")"));
+    assert!(script.contains("setAttribute(\"tabindex\", \"0\")"));
+    assert!(script.contains("继承 config.toml"));
+    assert!(script.contains("service_tier=\\\"priority\\\""));
+    assert!(script.contains("Fast 仅支持"));
+    assert!(script.contains("当前 thread"));
+    assert!(script.contains("standard"));
+    assert!(script.contains("fast"));
+}
+
+#[test]
+fn injection_script_prompts_for_markdown_export_path_when_supported() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("showSaveFilePicker"));
+    assert!(script.contains("suggestedName: filename"));
+    assert!(script.contains("createWritable()"));
+    assert!(script.contains("await writable.write(markdown)"));
+    assert!(script.contains("status: \"cancelled\""));
+    assert!(script.contains("导出已取消"));
+}
+
+#[test]
+fn injection_script_applies_fast_service_tier_contract() {
+    let cases = run_service_tier_contract_harness();
+
+    assert_eq!(cases["supportedFast"]["serviceTier"], "priority");
+    assert_eq!(cases["supportedFast"]["service_tier"], "priority");
+
+    assert_eq!(
+        cases["unsupportedModel"]["serviceTier"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        cases["unsupportedModel"]["service_tier"],
+        serde_json::Value::Null
+    );
+
+    assert_eq!(cases["turnWithoutModel"]["serviceTier"], "priority");
+    assert_eq!(cases["turnWithoutModelDiagnosticModel"], "gpt-5.4");
+
+    assert_eq!(
+        cases["customInheritUnsupported"]["serviceTier"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        cases["customInheritUnsupported"]["service_tier"],
+        serde_json::Value::Null
+    );
+
+    assert_eq!(cases["startConversation"]["serviceTier"], "priority");
+}
+
+fn run_service_tier_contract_harness() -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let script_path = temp.path().join("renderer-inject.js");
+    let harness_path = temp.path().join("service-tier-harness.cjs");
+    std::fs::write(&script_path, assets::injection_script(57321))
+        .expect("injection script should be written");
+    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
+    write!(
+        harness,
+        r#"
+const scriptPath = {script_path};
+const store = new Map();
+store.set("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
+function node() {{
+  return {{
+    appendChild() {{}},
+    prepend() {{}},
+    remove() {{}},
+    setAttribute() {{}},
+    removeAttribute() {{}},
+    addEventListener() {{}},
+    querySelector() {{ return null; }},
+    querySelectorAll() {{ return []; }},
+    closest() {{ return null; }},
+    classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
+    dataset: {{}},
+    style: {{}},
+    children: [],
+    isConnected: true,
+    textContent: "",
+    innerHTML: "",
+  }};
+}}
+globalThis.window = globalThis;
+window.__CODEX_PLUS_TEST_SERVICE_TIER__ = true;
+globalThis.document = {{
+  scripts: [],
+  documentElement: node(),
+  body: node(),
+  createElement: () => node(),
+  getElementById: () => null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener() {{}},
+  removeEventListener() {{}},
+}};
+globalThis.localStorage = {{
+  getItem: (key) => store.has(key) ? store.get(key) : null,
+  setItem: (key, value) => store.set(key, String(value)),
+  removeItem: (key) => store.delete(key),
+}};
+globalThis.location = {{ href: "https://codex.test/thread/thread-12345678", pathname: "/thread/thread-12345678", search: "", hash: "" }};
+window.location = globalThis.location;
+globalThis.navigator = {{ userAgent: "node-test" }};
+globalThis.performance = {{ getEntriesByType: () => [] }};
+require(scriptPath);
+const api = window.__codexPlusServiceTierTest;
+api.setServiceTierState({{ serviceTier: "priority", fastTierValue: "priority" }});
+api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
+
+api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
+const supportedFast = api.applyServiceTierOverride("turn/start", {{
+  threadId: "thread-12345678",
+  model: "gpt-5.4",
+  service_tier: null,
+}}, "conv-should-not-be-model");
+
+const unsupportedModel = api.applyServiceTierOverride("turn/start", {{
+  threadId: "thread-12345678",
+  model: "gpt-4.1",
+  service_tier: "priority",
+}}, "conv-should-not-be-model");
+
+const turnWithoutModel = api.applyServiceTierOverride("turn/start", {{
+  threadId: "thread-12345678",
+  service_tier: null,
+}}, "conversation-should-not-be-model");
+const turnWithoutModelDiagnosticModel = api.diagnostics().at(-1)?.detail?.model;
+
+api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
+api.setThreadState({{ mode: "custom", defaultMode: "inherit", entries: {{}}, draft: {{ mode: "inherit", at: Date.now() }} }});
+api.setServiceTierState({{ serviceTier: "priority" }});
+const customInheritUnsupported = api.applyServiceTierOverride("turn/start", {{
+  threadId: "thread-12345678",
+  service_tier: "priority",
+}}, "");
+
+api.setModelCatalog({{ status: "ok", model: "gpt-5.5", default_model: "gpt-5.5", models: ["gpt-5.5"] }});
+api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
+const startConversation = api.requestOverride({{
+  type: "start-conversation",
+  threadId: "thread-12345678",
+  model: "gpt-5.5",
+}});
+
+process.stdout.write(JSON.stringify({{
+  supportedFast,
+  unsupportedModel,
+  turnWithoutModel,
+  turnWithoutModelDiagnosticModel,
+  customInheritUnsupported,
+  startConversation,
+}}));
+"#,
+        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
+            .expect("script path should serialize")
+    )
+    .expect("harness should be written");
+    drop(harness);
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run service-tier harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON")
 }
 
 #[test]
@@ -177,6 +675,88 @@ fn injection_script_restores_thread_scroll_positions() {
 }
 
 #[test]
+fn injection_script_installs_upstream_branch_dropdown_adapter() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("installUpstreamBranchDropdownAdapter"));
+    assert!(script.contains("installUpstreamPendingWorktreeDispatcherPatch"));
+    assert!(script.contains("data-codex-upstream-branch-option"));
+    assert!(script.contains("codexUpstreamBranchSelection"));
+    assert!(script.contains("/upstream-worktree/defaults"));
+    assert!(script.contains("/upstream-worktree/prepare"));
+    assert!(script.contains("injectUpstreamBranchOptions"));
+    assert!(script.contains("Upstream"));
+    assert!(script.contains("data-base-branch"));
+    assert!(script.contains("data-project-id"));
+    assert!(script.contains("MutationObserver"));
+    assert!(script.contains("upstreamWorktreePayloadFromSelection"));
+    assert!(script.contains("readUpstreamBranchSelection"));
+    assert!(script.contains("writeUpstreamBranchSelection(null)"));
+    assert!(script.contains("currentProjectRepoPathFromSelectedProjectButton"));
+    assert!(script.contains("currentProjectRepoPathFromStartButton"));
+    assert!(script.contains("Start new chat in"));
+    assert!(script.contains("codexUpstreamProjectContext"));
+    assert!(script.contains("rememberStartNewChatProjectContext"));
+    assert!(script.contains("currentProjectContextForBranchMenu"));
+    assert!(script.contains("remoteProjectContextFromGlobalState"));
+    assert!(script.contains("upstreamBranchDefaultsInflight = new Map()"));
+    assert!(script.contains("upstreamRemoteBranchDefaultsCacheTtlMs"));
+    assert!(script.contains("upstreamBranchDefaultsInflight.delete(cacheKey)"));
+    assert!(script.contains("projectId:"));
+    assert!(script.contains("data-codex-upstream-branch-selection-label"));
+    assert!(script.contains("syncUpstreamBranchTriggerLabel"));
+    assert!(script.contains("syncUpstreamBranchMenuSelection"));
+    assert!(script.contains("applyUpstreamPendingWorktreeOverride"));
+    assert!(script.contains("pending-worktree-create"));
+    assert!(script.contains("qualifiedSourceRef"));
+    assert!(script.contains("refs/remotes/${remote}/${baseBranch}"));
+    assert!(script.contains("startingState: { ...request.startingState, branchName: sourceRef }"));
+    assert!(script.contains("data-codex-upstream-branch-check"));
+    assert!(script.contains("data-codex-upstream-branch-icon"));
+    assert!(script.contains("branchIconSvg"));
+    assert!(script.contains("checkmarkSvg"));
+    assert!(script.contains("aria-checked"));
+    assert!(script.contains("check.removeAttribute(\"hidden\")"));
+    assert!(script.contains("check.setAttribute(\"hidden\", \"\")"));
+    assert!(script.contains("handleNativeBranchSelection"));
+    assert!(script.contains("clearUpstreamBranchTriggerLabel"));
+    assert!(!script.contains(r#"text.includes("/")"#));
+    assert!(script.contains("newWorktreeModeActive"));
+    assert!(script.contains("effectiveElementRect"));
+    assert!(script.contains("removeUpstreamBranchOptions"));
+    assert!(script.contains("cleanupInvalidUpstreamBranchOptions"));
+    assert!(script.contains("branchMenuInNewWorktreeMode"));
+    assert!(script.contains("branchMenuTriggerIsBranchControl"));
+    assert!(script.contains("actual-upstream-refs-v16"));
+    assert!(script.contains("create and checkout new branch"));
+    assert!(script.contains("if (/^start in"));
+    assert!(script.contains("if (!branchMenuInNewWorktreeMode(trigger))"));
+}
+
+#[test]
+fn injection_script_prevents_switching_to_branches_used_by_other_worktrees() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("data-codex-branch-worktree-path"));
+    assert!(script.contains("annotateBranchMenuWorktreeUsage"));
+    assert!(script.contains("branchWorktreePathFromMenuItem"));
+    assert!(script.contains("该分支已在另一个 worktree 使用"));
+    assert!(script.contains("event.stopImmediatePropagation?.()"));
+}
+
+#[test]
+fn injection_script_rebuilds_upstream_options_for_each_project_branch_menu() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("currentProjectRepoPathForBranchMenu"));
+    assert!(script.contains("repoPathFromProjectLabel"));
+    assert!(script.contains("projectContextFromProjectLabel"));
+    assert!(script.contains("upstreamBranchOptionsMatchRefs"));
+    assert!(script.contains("upstreamBranchDefaultsCache = new Map()"));
+    assert!(script.contains("actual-upstream-refs-v16"));
+}
+
+#[test]
 fn manager_ui_exposes_pure_api_relay_mode_button() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -186,7 +766,7 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
     let commands =
         std::fs::read_to_string(repo.join("apps/codex-plus-manager/src-tauri/src/lib.rs")).unwrap();
 
-    assert!(source.contains("切换到混合 API"));
+    assert!(source.contains("官方混入 API Key"));
     assert!(source.contains("纯 API"));
     assert!(source.contains("apply_pure_api_injection"));
     assert!(commands.contains("commands::apply_pure_api_injection"));
@@ -287,7 +867,7 @@ fn pick_page_target_prefers_codex_title_or_url() {
 }
 
 #[test]
-fn pick_page_target_falls_back_to_first_injectable_page() {
+fn pick_page_target_leniently_falls_back_to_first_injectable_page() {
     let targets = vec![
         target(
             "browser",
@@ -335,8 +915,91 @@ fn pick_page_target_rejects_non_pages_and_pages_without_websocket() {
     assert!(
         error
             .to_string()
+            .contains("No injectable page target found")
+    );
+}
+
+#[test]
+fn pick_injectable_codex_page_target_rejects_non_codex_pages() {
+    let targets = vec![
+        target(
+            "browser",
+            "browser",
+            "Codex",
+            "https://codex.test",
+            Some("ws://browser"),
+        ),
+        target(
+            "other-page",
+            "page",
+            "Other App",
+            "https://example.test",
+            Some("ws://other"),
+        ),
+    ];
+
+    let error = pick_injectable_codex_page_target(&targets)
+        .expect_err("non-Codex page must not be selected for injection");
+
+    assert!(
+        error
+            .to_string()
             .contains("No injectable Codex page target found")
     );
+}
+
+#[test]
+fn pick_injectable_codex_page_target_requires_websocket() {
+    let targets = vec![target("codex", "page", "Codex", "https://codex.test", None)];
+
+    let error = pick_injectable_codex_page_target(&targets)
+        .expect_err("Codex page without websocket must not be selected for injection");
+
+    assert!(
+        error
+            .to_string()
+            .contains("No injectable Codex page target found")
+    );
+}
+
+#[tokio::test]
+async fn list_targets_can_query_ipv6_loopback_cdp_endpoint() {
+    let listener = TcpListener::bind("[::1]:0")
+        .await
+        .expect("IPv6 loopback listener should bind");
+    let port = listener.local_addr().unwrap().port();
+    let body = serde_json::to_vec(&json!([
+        {
+            "id": "page-1",
+            "type": "page",
+            "title": "Codex",
+            "url": "app://-/index.html",
+            "webSocketDebuggerUrl": format!("ws://[::1]:{port}/devtools/page/page-1"),
+        }
+    ]))
+    .unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("request should arrive");
+        let mut request = [0_u8; 1024];
+        let _ = stream.readable().await;
+        let _ = stream.try_read(&mut request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .try_write(response.as_bytes())
+            .expect("response headers should write");
+        stream.try_write(&body).expect("response body should write");
+    });
+
+    let targets = list_targets(port)
+        .await
+        .expect("CDP target query should fall back to IPv6 loopback");
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].id, "page-1");
+    server.await.expect("server task should complete");
 }
 
 #[tokio::test]

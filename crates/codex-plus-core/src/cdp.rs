@@ -18,12 +18,31 @@ pub struct CdpTarget {
 }
 
 pub async fn list_targets(debug_port: u16) -> anyhow::Result<Vec<CdpTarget>> {
-    let url = format!("http://127.0.0.1:{debug_port}/json");
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(CDP_HTTP_TIMEOUT)
         .build()
         .context("failed to build CDP HTTP client")?;
+
+    let urls = [
+        format!("http://127.0.0.1:{debug_port}/json"),
+        format!("http://[::1]:{debug_port}/json"),
+    ];
+    let mut errors = Vec::new();
+    for url in urls {
+        match query_targets_url(&client, &url).await {
+            Ok(targets) => return Ok(targets),
+            Err(error) => errors.push(format!("{url}: {error:#}")),
+        }
+    }
+
+    bail!(
+        "failed to query CDP targets on loopback addresses: {}",
+        errors.join("; ")
+    )
+}
+
+async fn query_targets_url(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<CdpTarget>> {
     let response = client
         .get(url)
         .send()
@@ -39,19 +58,13 @@ pub async fn list_targets(debug_port: u16) -> anyhow::Result<Vec<CdpTarget>> {
 }
 
 pub fn pick_page_target(targets: &[CdpTarget]) -> anyhow::Result<CdpTarget> {
-    let pages = targets.iter().filter(|target| {
-        target.target_type == "page"
-            && target
-                .web_socket_debugger_url
-                .as_deref()
-                .is_some_and(|url| !url.is_empty())
-    });
-
     let mut first_page = None;
-    for target in pages {
+    for target in targets
+        .iter()
+        .filter(|target| is_injectable_page_target(target))
+    {
         first_page.get_or_insert(target);
-        let haystack = format!("{} {}", target.title, target.url).to_lowercase();
-        if haystack.contains("codex") {
+        if is_codex_page_target(target) {
             return Ok(target.clone());
         }
     }
@@ -60,5 +73,34 @@ pub fn pick_page_target(targets: &[CdpTarget]) -> anyhow::Result<CdpTarget> {
         return Ok(target.clone());
     }
 
+    bail!("No injectable page target found")
+}
+
+pub fn pick_injectable_codex_page_target(targets: &[CdpTarget]) -> anyhow::Result<CdpTarget> {
+    for target in targets
+        .iter()
+        .filter(|target| is_injectable_page_target(target))
+    {
+        if is_codex_page_target(target) {
+            return Ok(target.clone());
+        }
+    }
+
     bail!("No injectable Codex page target found")
+}
+
+pub fn is_injectable_page_target(target: &CdpTarget) -> bool {
+    target.target_type == "page"
+        && target
+            .web_socket_debugger_url
+            .as_deref()
+            .is_some_and(|url| !url.is_empty())
+}
+
+pub fn is_codex_page_target(target: &CdpTarget) -> bool {
+    if target.target_type != "page" {
+        return false;
+    }
+    let haystack = format!("{} {}", target.title, target.url).to_lowercase();
+    haystack.contains("codex")
 }

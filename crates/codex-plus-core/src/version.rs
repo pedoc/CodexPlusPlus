@@ -6,6 +6,6 @@ mod tests {
 
     #[test]
     fn exposes_workspace_version() {
-        assert!(!VERSION.is_empty());
+        assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
     }
 }

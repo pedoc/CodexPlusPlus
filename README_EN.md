@@ -36,6 +36,16 @@ The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG in
 ## Sponsors
 
 <p align="center">
+  <a href="https://jojocode.com/">
+    <img src="docs/images/sponsor-jojocode.svg" alt="JOJO Code" width="180">
+  </a>
+</p>
+<p align="center">
+  <a href="https://jojocode.com/"><strong>JOJO Code | Official Codex++ Relay</strong></a><br>
+  The official Codex++ relay service, focused on stable access and cost-effective pricing. JOJO Code supports GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2, and more for daily development, team collaboration, and long-running project workflows.
+</p>
+
+<p align="center">
   <a href="mailto:1727532@qq.com">Want to be shown below?</a>
 </p>
 <table>
@@ -49,7 +59,7 @@ The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG in
         <img src="docs/images/sponsor-jojocode.svg" alt="JOJO Code" width="150">
       </a>
     </td>
-    <td><a href="https://jojocode.com/"><strong>JOJO Code | Official Codex++ Relay</strong></a><br>Thanks to JOJO Code for sponsoring this project! JOJO Code is the official Codex++ relay service. It is built for daily development and team collaboration, providing stable Codex API access for quick onboarding, long-term use, and project workflows.</td>
+    <td><a href="https://jojocode.com/"><strong>JOJO Code | Official Codex++ Relay</strong></a><br>Thanks to JOJO Code for sponsoring this project. JOJO Code is the official Codex++ relay service with cost-effective pricing and stable, easy-to-configure Codex API access. It supports GPT-5.5, GPT-5.4, Claude Opus 4.8, Claude Opus 4.7, gpt-image-2, and more for daily development, quick setup, team collaboration, and continuous use.</td>
   </tr>
   <tr>
     <td align="center">
@@ -69,6 +79,22 @@ The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG in
   </tr>
   <tr>
     <td align="center">
+      <a href="https://apikey.fun/register?aff=CODEX">
+        <img src="docs/images/sponsor-apikey-fun.png" alt="APIKEY.FUN" width="150">
+      </a>
+    </td>
+    <td><a href="https://apikey.fun/register?aff=CODEX"><strong>APIKEY.FUN</strong></a><br>Thanks to APIKEY.FUN for sponsoring this project! APIKEY.FUN is an AI relay platform focused on open, stable, and cost-effective access to mainstream global models. It supports API relay services for Claude, OpenAI, Gemini, and other popular models, with prices as low as 7% of the official rate. Register through the dedicated link to receive up to a permanent 5% recharge discount.</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <a href="https://runapi.co/register?aff=AWJq">
+        <img src="docs/images/sponsor-runapi.png" alt="RunAPI" width="150">
+      </a>
+    </td>
+    <td><a href="https://runapi.co/register?aff=AWJq"><strong>RunAPI</strong></a><br>Thanks to RunAPI for sponsoring this project! RunAPI is an efficient and stable OpenRouter alternative API platform. One API key can access OpenAI, Claude, Gemini, DeepSeek, Grok, and 150+ mainstream models at prices as low as 10% of the original rate, with seamless compatibility for tools such as Claude Code and OpenClaw.</td>
+  </tr>
+  <tr>
+    <td align="center">
       <a href="https://www.0029.org/?promo=AFF11F">
         <img src="docs/images/sponsor-0029.svg" alt="0029 Cloud Bridge" width="150">
       </a>
@@ -77,19 +103,17 @@ The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG in
   </tr>
   <tr>
     <td align="center">
-      <a href="https://rawchat.cn">
-        <img src="docs/images/sponsor-rawchat.svg" alt="RawChat" width="150">
-      </a>
-    </td>
-    <td><a href="https://rawchat.cn"><strong>RawChat | Codex Relay Station</strong></a><br>A long-running relay station with monthly plans, low-rate usage, high cache hit rates, Pro/Plus account pools, and dedicated all-day maintenance.</td>
-  </tr>
-  <tr>
-    <td align="center">
       <a href="https://coder.visioncoder.cn">
         <img src="https://coder.visioncoder.cn/logo.png" alt="VisionCoder" width="110">
       </a>
     </td>
     <td><a href="https://coder.visioncoder.cn"><strong>VisionCoder Developer Platform</strong></a><br>Thanks to VisionCoder for supporting this project. VisionCoder Developer Platform is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. VisionCoder is also offering our users a limited-time <a href="https://coder.visioncoder.cn">Token Plan</a> promotion: buy 1 month and get 1 month free.</td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/sponsor-codelf.png" alt="Codelf" width="110">
+    </td>
+    <td><strong>Codelf</strong><br>Codelf is a desktop app with an autonomous AI Agent and a full editor. It can help users build projects, organize materials, operate local apps, and work with multiple AI model providers through natural language, with direct access in China and high context-cache efficiency.</td>
   </tr>
 </table>
 
@@ -104,6 +128,7 @@ The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG in
 - Independent user script management with startup injection.
 - Provider Sync to keep historical sessions visible after switching providers.
 - Zed open entry detects remote SSH context and opens the matching remote file in Zed Remote Development from Codex.
+- Upstream worktree creation: create new worktrees from `upstream/<base-branch>` after fetching the remote branch, reducing conflicts caused by stale local HEAD state.
 - GitHub Release updates. Both the manager and silent launcher can detect available updates.
 - Windows single instance, no console window, administrator manifest, and system Desktop path detection.
 - Separate macOS x64 and arm64 DMGs. The silent launcher hides its Dock icon.
@@ -111,6 +136,21 @@ The Windows installer creates desktop and Start Menu shortcuts. The macOS DMG in
 ## Relay Injection
 
 Relay injection is for users who are already logged in with an official ChatGPT account in Codex/ChatGPT and want model requests to go through a custom compatible API.
+
+The boundary of this hybrid mode is:
+
+- The official ChatGPT/Codex login state still owns Codex App account features and the plugin entry.
+- The relay profile only controls the Base URL, key, and model names used for model requests.
+- The compatible API provider is not tied to any specific vendor; it only needs to match the selected upstream protocol and Codex configuration.
+- Clearing API mode should return Codex to the official login mode so the official account and plugins keep working.
+
+Before applying relay injection, run a minimal preflight:
+
+1. Make sure Codex has detected the ChatGPT login state and the plugin entry is available.
+2. Confirm the custom Base URL is reachable and supports the selected upstream protocol, such as a Responses-compatible endpoint.
+3. Test the target key with the smallest useful auth probe, such as a model-list request or a short message request.
+4. Only record whether the key exists and whether auth passed. Do not paste real keys into logs, screenshots, or issues.
+5. Make sure `~/.codex/config.toml` has a backup so clearing API mode can safely roll back.
 
 In the manager's Relay Injection page:
 
@@ -161,7 +201,7 @@ The manager's About page can check and start updates. When the silent launcher f
 
 - Codex config: `~/.codex/config.toml`
 - Codex auth state: `~/.codex/auth.json`
-- Codex local database: `~/.codex/state_5.sqlite`
+- Codex local database: prefers `~/.codex/sqlite/*.db`, falls back to legacy `~/.codex/state_5.sqlite`
 - Codex++ state and logs: `~/.codex-session-delete/`
 - Provider Sync backups: `~/.codex/backups_state/provider-sync`
 
@@ -180,6 +220,16 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:57321/backend/status -Body 
 ```
 
 If the endpoint works but the plugin still times out, it is usually a Codex page CDP bridge or script cache issue. Restart Codex++, or check manager logs for `renderer.script_loaded`, `bridge.request`, and `bridge.response`.
+
+### How is Upstream worktree different from Codex native creation?
+
+Codex++ updates the remote branch first, then creates the worktree as if you ran:
+
+```bash
+git worktree add -b <new-branch> <worktree-path> upstream/<base-branch>
+```
+
+The new worktree starts from the fresh remote tracking branch instead of the local HEAD used by the current session. If Codex++ cannot safely recognize the current Codex version's native worktree form, use the Codex++ menu entry and enter the repository path, branch name, worktree path, remote, and base branch manually.
 
 ### macOS says the app cannot be opened or is damaged
 
@@ -223,9 +273,9 @@ scripts/installer/
 
 ## Community and Support
 
-Scan the QR code to join the Codex++ discussion group, report issues, share usage notes, or suggest features:
+Join the Codex++ discussion group to report issues, share usage notes, or suggest features:
 
-<img src="docs/images/discussion-group-qr.jpg" alt="Codex++ discussion group QR code" width="260">
+WeChat group: [get the latest QR code](https://docs.qq.com/doc/DQ2VOanZTTFZJcUpZ#).
 
 If Codex++ has helped you, you can buy me a coffee or send a small tip to support continued maintenance.
 

@@ -43,12 +43,28 @@ impl BridgeContext {
     ) -> Self {
         Self::new(Arc::new(CoreSettingsService::default()), runtime, data)
     }
+
+    pub fn core_with_data_and_app_dir(
+        runtime: Arc<dyn BridgeRuntimeService>,
+        data: Arc<dyn BridgeDataService>,
+        app_dir: PathBuf,
+    ) -> Self {
+        Self::new(
+            Arc::new(CoreSettingsService::with_app_dir(app_dir)),
+            runtime,
+            data,
+        )
+    }
 }
 
 #[async_trait]
 pub trait BridgeSettingsService: Send + Sync {
     async fn get_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings>;
+
+    async fn codex_app_version(&self) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
 }
 
 #[async_trait]
@@ -56,6 +72,7 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn user_script_inventory(&self) -> anyhow::Result<Value>;
     async fn set_user_scripts_enabled(&self, enabled: bool) -> anyhow::Result<Value>;
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value>;
+    async fn delete_user_script(&self, key: String) -> anyhow::Result<Value>;
     async fn reload_user_scripts(&self) -> anyhow::Result<Value>;
     async fn open_devtools(&self) -> anyhow::Result<Value>;
     async fn open_manager(&self) -> anyhow::Result<Value>;
@@ -67,6 +84,13 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn resolve_zed_remote_host(&self, payload: Value) -> anyhow::Result<Value>;
     async fn fallback_zed_remote_request(&self, payload: Value) -> anyhow::Result<Value>;
     async fn open_zed_remote(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn list_zed_remote_projects(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn remember_zed_remote_project(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn forget_zed_remote_project(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn upstream_worktree_status(&self) -> anyhow::Result<Value>;
+    async fn upstream_worktree_defaults(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn upstream_worktree_prepare(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn upstream_worktree_create(&self, payload: Value) -> anyhow::Result<Value>;
 }
 
 #[async_trait]
@@ -74,6 +98,7 @@ pub trait BridgeDataService: Send + Sync {
     async fn delete(&self, session: SessionRef) -> anyhow::Result<DeleteResult>;
     async fn undo(&self, undo_token: String) -> anyhow::Result<DeleteResult>;
     async fn export_markdown(&self, session: SessionRef) -> anyhow::Result<ExportResult>;
+    async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value>;
     async fn find_archived_thread_by_title(
         &self,
         title: String,
@@ -104,8 +129,10 @@ pub async fn handle_bridge_request(
         }),
     );
     let result = match path {
-        "/settings/get" => settings_value(ctx.settings.get_settings().await),
-        "/settings/set" => settings_value(ctx.settings.set_settings(payload.clone()).await),
+        "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
+        "/settings/set" => {
+            settings_value(&ctx, ctx.settings.set_settings(payload.clone()).await).await
+        }
         "/user-scripts/list" => ctx.runtime.user_script_inventory().await,
         "/user-scripts/set-enabled" => {
             let enabled = payload
@@ -126,6 +153,14 @@ pub async fn handle_bridge_request(
                 .unwrap_or(true);
             ctx.runtime.set_user_script_enabled(key, enabled).await
         }
+        "/user-scripts/delete" => {
+            let key = payload
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            ctx.runtime.delete_user_script(key).await
+        }
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager().await,
@@ -142,6 +177,25 @@ pub async fn handle_bridge_request(
                 .await
         }
         "/zed-remote/open" => ctx.runtime.open_zed_remote(payload.clone()).await,
+        "/zed-remote/projects" => ctx.runtime.list_zed_remote_projects(payload.clone()).await,
+        "/zed-remote/remember-project" => {
+            ctx.runtime
+                .remember_zed_remote_project(payload.clone())
+                .await
+        }
+        "/zed-remote/forget-project" => {
+            ctx.runtime.forget_zed_remote_project(payload.clone()).await
+        }
+        "/upstream-worktree/status" => ctx.runtime.upstream_worktree_status().await,
+        "/upstream-worktree/defaults" => {
+            ctx.runtime
+                .upstream_worktree_defaults(payload.clone())
+                .await
+        }
+        "/upstream-worktree/prepare" => {
+            ctx.runtime.upstream_worktree_prepare(payload.clone()).await
+        }
+        "/upstream-worktree/create" => ctx.runtime.upstream_worktree_create(payload.clone()).await,
         "/delete" => result_value(ctx.data.delete(session_from_payload(&payload)).await),
         "/undo" => {
             let undo_token = payload
@@ -156,6 +210,11 @@ pub async fn handle_bridge_request(
                 .export_markdown(session_from_payload(&payload))
                 .await,
         ),
+        "/thread-usage-history" => {
+            ctx.data
+                .thread_usage_history(session_from_payload(&payload))
+                .await
+        }
         "/archived-thread" => {
             let title = payload
                 .get("title")
@@ -214,6 +273,16 @@ pub async fn handle_bridge_request(
 #[derive(Default)]
 pub struct CoreSettingsService {
     store: SettingsStore,
+    app_dir: Option<PathBuf>,
+}
+
+impl CoreSettingsService {
+    fn with_app_dir(app_dir: PathBuf) -> Self {
+        Self {
+            store: SettingsStore::default(),
+            app_dir: Some(app_dir),
+        }
+    }
 }
 
 #[async_trait]
@@ -224,6 +293,21 @@ impl BridgeSettingsService for CoreSettingsService {
 
     async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings> {
         self.store.update(payload)
+    }
+
+    async fn codex_app_version(&self) -> anyhow::Result<String> {
+        if let Some(app_dir) = self.app_dir.as_deref() {
+            return Ok(crate::app_paths::codex_app_version(app_dir).unwrap_or_default());
+        }
+        let settings = self.store.load().unwrap_or_default();
+        let app_dir = crate::app_paths::resolve_codex_app_dir_with_saved(
+            None,
+            Some(settings.codex_app_path.as_str()),
+        );
+        Ok(app_dir
+            .as_deref()
+            .and_then(crate::app_paths::codex_app_version)
+            .unwrap_or_default())
     }
 }
 
@@ -304,6 +388,16 @@ impl BridgeRuntimeService for CoreRuntimeService {
         match &self.user_scripts {
             Some(user_scripts) => {
                 user_scripts.set_script_enabled(&key, enabled)?;
+                user_scripts.inventory()
+            }
+            None => Ok(empty_user_script_inventory()),
+        }
+    }
+
+    async fn delete_user_script(&self, key: String) -> anyhow::Result<Value> {
+        match &self.user_scripts {
+            Some(user_scripts) => {
+                user_scripts.delete_user_script(&key)?;
                 user_scripts.inventory()
             }
             None => Ok(empty_user_script_inventory()),
@@ -391,6 +485,40 @@ impl BridgeRuntimeService for CoreRuntimeService {
     async fn open_zed_remote(&self, payload: Value) -> anyhow::Result<Value> {
         Ok(crate::zed_remote::open_zed_remote(&payload))
     }
+
+    async fn list_zed_remote_projects(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(crate::zed_remote::list_zed_remote_projects_response(
+            &payload,
+        ))
+    }
+
+    async fn remember_zed_remote_project(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(crate::zed_remote::remember_zed_remote_project_response(
+            &payload,
+        ))
+    }
+
+    async fn forget_zed_remote_project(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(crate::zed_remote::forget_zed_remote_project_response(
+            &payload,
+        ))
+    }
+
+    async fn upstream_worktree_status(&self) -> anyhow::Result<Value> {
+        Ok(crate::upstream_worktree::status_response())
+    }
+
+    async fn upstream_worktree_defaults(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(crate::upstream_worktree::defaults_response(&payload))
+    }
+
+    async fn upstream_worktree_prepare(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(crate::upstream_worktree::prepare_response(&payload))
+    }
+
+    async fn upstream_worktree_create(&self, payload: Value) -> anyhow::Result<Value> {
+        Ok(crate::upstream_worktree::create_response(&payload))
+    }
 }
 
 struct UnavailableDataService;
@@ -425,6 +553,15 @@ impl BridgeDataService for UnavailableDataService {
             filename: None,
             markdown: None,
         })
+    }
+
+    async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "failed",
+            "session_id": session.session_id,
+            "message": "Thread usage history service is not wired in core launcher hooks",
+            "history": []
+        }))
     }
 
     async fn find_archived_thread_by_title(
@@ -480,8 +617,27 @@ fn spawn_manager(manager_path: &Path) -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
 }
 
-fn settings_value(result: anyhow::Result<BackendSettings>) -> anyhow::Result<Value> {
-    Ok(serde_json::to_value(result?)?)
+fn settings_payload_value(
+    settings: BackendSettings,
+    codex_app_version: String,
+) -> anyhow::Result<Value> {
+    let mut value = serde_json::to_value(settings)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "codexAppVersion".to_string(),
+            Value::String(codex_app_version),
+        );
+    }
+    Ok(value)
+}
+
+async fn settings_value(
+    ctx: &BridgeContext,
+    result: anyhow::Result<BackendSettings>,
+) -> anyhow::Result<Value> {
+    let settings = result?;
+    let codex_app_version = ctx.settings.codex_app_version().await.unwrap_or_default();
+    settings_payload_value(settings, codex_app_version)
 }
 
 fn result_value<T>(result: anyhow::Result<T>) -> anyhow::Result<Value>

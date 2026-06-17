@@ -128,20 +128,20 @@ jobs:
           VERSION="${VERSION#V}"
           BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
 
-      - name: Build macOS zip asset
-        shell: bash
+      - name: Verify macOS bundle structure
         run: |
-          VERSION="${RELEASE_TAG#v}"
-          VERSION="${VERSION#V}"
-          mkdir -p dist/macos/app-${{ matrix.arch }}
-          cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
-          cp "target/${{ matrix.target }}/release/codex-plus-plus-manager" "dist/macos/app-${{ matrix.arch }}/"
-          (cd dist/macos && zip -r "CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.zip" "app-${{ matrix.arch }}")
+          set -euo pipefail
+          for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
+            test -f "$app/Contents/Info.plist"
+            test -f "$app/Contents/PkgInfo"
+            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            plutil -lint "$app/Contents/Info.plist" >/dev/null
+            codesign -dv "$app" >/dev/null 2>&1
+            echo "verified: $app"
+          done
 
       - name: Upload macOS DMG
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: |
-            dist/macos/*.dmg
-            dist/macos/*.zip
+          tag_name: ${{ github.event.release.tag_name }}
+          files: dist/macos/*.dmg

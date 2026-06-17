@@ -27,6 +27,7 @@ async fn bridge_routes_cover_all_current_paths() {
             "/user-scripts/set-script-enabled",
             json!({"key": "user:a.js", "enabled": false}),
         ),
+        ("/user-scripts/delete", json!({"key": "user:a.js"})),
         ("/user-scripts/reload", json!({})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
@@ -48,10 +49,33 @@ async fn bridge_routes_cover_all_current_paths() {
             "/zed-remote/open",
             json!({"ssh": {"host": "example.com"}, "path": "/home/app.py"}),
         ),
+        ("/zed-remote/projects", json!({})),
+        (
+            "/zed-remote/remember-project",
+            json!({"ssh": {"host": "example.com"}, "path": "/home/app.py"}),
+        ),
+        (
+            "/zed-remote/forget-project",
+            json!({"id": "zed-remote-project:test"}),
+        ),
+        ("/upstream-worktree/status", json!({})),
+        ("/upstream-worktree/defaults", json!({"repoPath": "/repo"})),
+        (
+            "/upstream-worktree/prepare",
+            json!({"repoPath": "/repo", "remote": "upstream", "baseBranch": "main"}),
+        ),
+        (
+            "/upstream-worktree/create",
+            json!({"repoPath": "/repo", "branchName": "feature/demo"}),
+        ),
         ("/delete", json!({"session_id": "s1", "title": "First"})),
         ("/undo", json!({"undo_token": "undo-1"})),
         (
             "/export-markdown",
+            json!({"session_id": "s1", "title": "First"}),
+        ),
+        (
+            "/thread-usage-history",
             json!({"session_id": "s1", "title": "First"}),
         ),
         ("/archived-thread", json!({"title": "Archived"})),
@@ -76,6 +100,121 @@ async fn bridge_routes_cover_all_current_paths() {
             "{path} should be routed"
         );
     }
+}
+
+#[tokio::test]
+async fn settings_get_includes_runtime_codex_app_version() {
+    let ctx = BridgeContext::new(
+        Arc::new(FakeSettings::with_codex_app_version("26.601.21317")),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(ctx, "/settings/get", json!({})).await;
+
+    assert_eq!(result["codexAppVersion"], json!("26.601.21317"));
+    assert_eq!(result["codexAppPluginEntryUnlock"], json!(true));
+    assert_eq!(result["codexAppPluginMarketplaceUnlock"], json!(true));
+    assert_eq!(result["codexAppForcePluginInstall"], json!(true));
+}
+
+#[tokio::test]
+async fn settings_set_does_not_persist_runtime_codex_app_version() {
+    let settings = Arc::new(FakeSettings::with_codex_app_version("26.601.21317"));
+    let ctx = BridgeContext::new(
+        settings.clone(),
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+    );
+
+    let result = handle_bridge_request(
+        ctx,
+        "/settings/set",
+        json!({
+            "codexAppVersion": "1.2.3",
+            "codexAppPluginMarketplaceUnlock": false
+        }),
+    )
+    .await;
+
+    assert_eq!(result["codexAppVersion"], json!("26.601.21317"));
+    assert_eq!(result["codexAppPluginMarketplaceUnlock"], json!(false));
+
+    let persisted = settings.settings.lock().unwrap().clone();
+    let persisted_value = serde_json::to_value(persisted).unwrap();
+    assert!(persisted_value.get("codexAppVersion").is_none());
+}
+
+#[tokio::test]
+async fn bridge_context_core_with_app_dir_exposes_runtime_codex_app_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp
+        .path()
+        .join("OpenAI.Codex_26.601.21317.0_x64__abc")
+        .join("app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    let ctx = BridgeContext::core_with_data_and_app_dir(
+        Arc::new(FakeRuntime::default()),
+        Arc::new(FakeData::default()),
+        app_dir,
+    );
+
+    let result = handle_bridge_request(ctx, "/settings/get", json!({})).await;
+
+    assert_eq!(result["codexAppVersion"], json!("26.601.21317.0"));
+}
+
+#[tokio::test]
+async fn upstream_worktree_routes_are_dispatched_to_runtime() {
+    let ctx = test_context();
+
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/upstream-worktree/status", json!({})).await,
+        json!({"status": "ok", "feature": "upstream-worktree"})
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/upstream-worktree/defaults",
+            json!({"repoPath": "/repo"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "defaultRemote": "upstream",
+            "defaultBaseBranch": "main",
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/upstream-worktree/create",
+            json!({"repoPath": "/repo", "branchName": "feature/demo"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "branchName": "feature/demo",
+            "worktreePath": "/repo-feature-demo",
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx,
+            "/upstream-worktree/prepare",
+            json!({"repoPath": "/repo", "remote": "upstream", "baseBranch": "main"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "sourceRef": "upstream/main",
+            "qualifiedSourceRef": "refs/remotes/upstream/main",
+        })
+    );
 }
 
 #[tokio::test]
@@ -104,12 +243,14 @@ async fn settings_routes_use_settings_service() {
     let updated = handle_bridge_request(
         ctx.clone(),
         "/settings/set",
-        json!({"providerSyncEnabled": true, "cliWrapperApiKeyEnv": ""}),
+        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppServiceTierControls": true, "cliWrapperApiKeyEnv": ""}),
     )
     .await;
     let loaded = handle_bridge_request(ctx, "/settings/get", json!({})).await;
 
     assert_eq!(updated["providerSyncEnabled"], true);
+    assert_eq!(updated["codexAppSessionDelete"], false);
+    assert_eq!(updated["codexAppServiceTierControls"], true);
     assert_eq!(updated["cliWrapperApiKeyEnv"], "CUSTOM_OPENAI_API_KEY");
     assert_eq!(loaded, updated);
 }
@@ -196,12 +337,47 @@ async fn runtime_status_devtools_repair_and_ads_routes_are_dispatched() {
     );
     assert_eq!(
         handle_bridge_request(
-            ctx,
+            ctx.clone(),
             "/zed-remote/open",
             json!({"ssh": {"host": "example.com"}, "path": "/home/app.py"}),
         )
         .await,
-        json!({"status": "ok", "url": "ssh://example.com/home/app.py"})
+        json!({"status": "ok", "url": "ssh://example.com/home/app.py", "strategy": "addToFocusedWorkspace"})
+    );
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/zed-remote/projects", json!({})).await,
+        json!({
+            "status": "ok",
+            "projects": [{
+                "id": "zed-remote-project:test",
+                "label": "sealos-skills",
+                "hostId": "remote-ssh-codex-managed:remote",
+                "ssh": {"user": "longnv", "host": "192.168.100.31", "port": null},
+                "path": "/Users/longnv/bin/repo/sealos-skills",
+                "url": "ssh://longnv@192.168.100.31/Users/longnv/bin/repo/sealos-skills",
+                "source": "codexRemoteProject",
+                "lastOpenedAtMs": null,
+                "isCurrent": false
+            }]
+        })
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/zed-remote/remember-project",
+            json!({"ssh": {"host": "example.com"}, "path": "/home/app.py"}),
+        )
+        .await,
+        json!({"status": "ok", "remembered": true})
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx,
+            "/zed-remote/forget-project",
+            json!({"id": "zed-remote-project:test"}),
+        )
+        .await,
+        json!({"status": "ok", "removed": 1})
     );
 }
 
@@ -236,6 +412,37 @@ async fn data_routes_forward_payloads_to_data_service() {
         )
         .await["filename"],
         "First.md"
+    );
+    assert_eq!(
+        handle_bridge_request(
+            ctx.clone(),
+            "/thread-usage-history",
+            json!({"session_id": "s1", "title": "First"}),
+        )
+        .await,
+        json!({
+            "status": "ok",
+            "session_id": "s1",
+            "history": [
+                {
+                    "source": "rollout-history",
+                    "conversation_id": "local:s1",
+                    "turn_id": "turn-1",
+                    "observed_at": "2026-06-02T05:00:00Z",
+                    "usage": {
+                        "inputTokens": 1200,
+                        "outputTokens": 120,
+                        "totalTokens": 1320,
+                        "cachedTokens": 900,
+                        "cacheReadTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "contextUsed": 1320,
+                        "contextLimit": 258400,
+                        "hasBreakdown": true
+                    }
+                }
+            ]
+        })
     );
     assert_eq!(
         handle_bridge_request(
@@ -318,6 +525,8 @@ async fn user_script_manager_scans_and_persists_inventory_shape() {
     let disabled = manager.inventory().unwrap();
     manager.set_script_enabled("user:a.js", false).unwrap();
     let script_disabled = manager.inventory().unwrap();
+    manager.delete_user_script("user:a.js").unwrap();
+    let deleted = manager.inventory().unwrap();
 
     assert_eq!(listed["enabled"], true);
     assert_eq!(
@@ -337,13 +546,70 @@ async fn user_script_manager_scans_and_persists_inventory_shape() {
     assert_eq!(disabled["enabled"], false);
     assert_eq!(disabled["scripts"][0]["status"], "disabled");
     assert_eq!(script_disabled["scripts"][1]["enabled"], false);
+    assert_eq!(deleted["scripts"].as_array().unwrap().len(), 1);
+    assert!(!user_dir.join("a.js").exists());
     assert_eq!(
         serde_json::from_str::<Value>(
             &std::fs::read_to_string(temp.path().join("user_scripts.json")).unwrap()
         )
         .unwrap(),
-        json!({"enabled": false, "scripts": {"user:a.js": false}})
+        json!({"enabled": false, "scripts": {}})
     );
+}
+
+#[tokio::test]
+async fn user_script_manager_deletes_market_script_metadata_and_rejects_builtin_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    let builtin_dir = temp.path().join("builtin");
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&builtin_dir).unwrap();
+    std::fs::write(builtin_dir.join("demo.js"), "window.demo = true;").unwrap();
+    std::fs::create_dir_all(&user_dir).unwrap();
+    let manager = UserScriptManager::new(
+        builtin_dir,
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    let script = codex_plus_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: "https://example.com/demo".to_string(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: String::new(),
+    };
+
+    codex_plus_core::script_market::install_market_script_content(
+        &manager,
+        &script,
+        b"window.demo = true;",
+    )
+    .unwrap();
+    manager
+        .set_script_enabled("user:market-demo.js", false)
+        .unwrap();
+
+    let error = manager.delete_user_script("builtin:demo.js").unwrap_err();
+    assert!(error.to_string().contains("only user scripts"));
+    manager.delete_user_script("user:market-demo.js").unwrap();
+
+    assert!(!user_dir.join("market-demo.js").exists());
+    assert!(
+        manager.inventory().unwrap()["scripts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|script| script["market_id"] != "demo")
+    );
+    let saved = serde_json::from_str::<Value>(
+        &std::fs::read_to_string(temp.path().join("user_scripts.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(saved.get("market").is_none());
+    assert_eq!(saved["scripts"], json!({}));
 }
 
 #[tokio::test]
@@ -476,6 +742,146 @@ fn user_script_manager_tolerates_bad_config_fields_and_updates_atomically() {
     assert_eq!(saved["scripts"]["user:c.js"], false);
 }
 
+#[test]
+fn script_market_manifest_filters_invalid_entries() {
+    let raw = serde_json::json!({
+        "version": 1,
+        "updated_at": "2026-05-21T00:00:00Z",
+        "scripts": [
+            {
+                "id": "demo",
+                "name": "Demo",
+                "description": "Useful demo",
+                "version": "1.0.0",
+                "author": "BigPizzaV3",
+                "tags": ["ui", 42],
+                "homepage": "https://example.com/demo",
+                "script_url": "https://example.com/demo.js",
+                "sha256": ""
+            },
+            { "id": "", "name": "Bad", "version": "1", "script_url": "https://example.com/bad.js" },
+            { "id": "missing-url", "name": "Bad", "version": "1" }
+        ]
+    });
+
+    let manifest = codex_plus_core::script_market::parse_market_manifest(raw).unwrap();
+
+    assert_eq!(manifest.version, 1);
+    assert_eq!(manifest.updated_at.as_deref(), Some("2026-05-21T00:00:00Z"));
+    assert_eq!(manifest.scripts.len(), 1);
+    assert_eq!(manifest.scripts[0].id, "demo");
+    assert_eq!(manifest.scripts[0].tags, vec!["ui"]);
+}
+
+#[test]
+fn user_script_inventory_includes_market_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("market-demo.js"), "window.demo = true;").unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir,
+        temp.path().join("user_scripts.json"),
+    );
+
+    manager
+        .record_market_install(&codex_plus_core::script_market::MarketScript {
+            id: "demo".to_string(),
+            name: "Demo".to_string(),
+            description: "Useful demo".to_string(),
+            version: "1.0.0".to_string(),
+            author: "BigPizzaV3".to_string(),
+            tags: vec!["ui".to_string()],
+            homepage: "https://example.com/demo".to_string(),
+            script_url: "https://example.com/demo.js".to_string(),
+            sha256: String::new(),
+        })
+        .unwrap();
+
+    let inventory = manager.inventory().unwrap();
+
+    assert_eq!(inventory["scripts"][0]["key"], "user:market-demo.js");
+    assert_eq!(inventory["scripts"][0]["market_id"], "demo");
+    assert_eq!(inventory["scripts"][0]["version"], "1.0.0");
+    assert_eq!(inventory["scripts"][0]["installed"], true);
+    assert_eq!(
+        inventory["scripts"][0]["source_url"],
+        "https://example.com/demo.js"
+    );
+    assert_eq!(
+        inventory["scripts"][0]["homepage"],
+        "https://example.com/demo"
+    );
+}
+
+#[test]
+fn install_market_script_writes_file_and_records_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        temp.path().join("user"),
+        temp.path().join("user_scripts.json"),
+    );
+    let script = codex_plus_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: "https://example.com/demo".to_string(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: String::new(),
+    };
+
+    codex_plus_core::script_market::install_market_script_content(
+        &manager,
+        &script,
+        b"window.demo = true;",
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("user").join("market-demo.js")).unwrap(),
+        "window.demo = true;"
+    );
+    let inventory = manager.inventory().unwrap();
+    assert_eq!(inventory["scripts"][0]["market_id"], "demo");
+}
+
+#[test]
+fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    std::fs::create_dir_all(&user_dir).unwrap();
+    std::fs::write(user_dir.join("market-demo.js"), "old").unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    let script = codex_plus_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: String::new(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: "0000".to_string(),
+    };
+
+    codex_plus_core::script_market::install_market_script_content(&manager, &script, b"new")
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(user_dir.join("market-demo.js")).unwrap(),
+        "new"
+    );
+}
+
 #[tokio::test]
 async fn launch_lifecycle_uses_hook_supplied_bridge_context_for_injection() {
     let temp = tempfile::tempdir().unwrap();
@@ -520,6 +926,16 @@ fn test_context() -> BridgeContext {
 #[derive(Default)]
 struct FakeSettings {
     settings: Mutex<BackendSettings>,
+    codex_app_version: Mutex<String>,
+}
+
+impl FakeSettings {
+    fn with_codex_app_version(version: &str) -> Self {
+        Self {
+            settings: Mutex::new(BackendSettings::default()),
+            codex_app_version: Mutex::new(version.to_string()),
+        }
+    }
 }
 
 #[async_trait]
@@ -537,6 +953,26 @@ impl BridgeSettingsService for FakeSettings {
         }
         if let Some(value) = payload.get("enhancementsEnabled").and_then(Value::as_bool) {
             raw.insert("enhancementsEnabled".to_string(), json!(value));
+        }
+        for key in [
+            "codexAppPluginEntryUnlock",
+            "codexAppPluginMarketplaceUnlock",
+            "codexAppForcePluginInstall",
+            "codexAppModelWhitelistUnlock",
+            "codexAppSessionDelete",
+            "codexAppMarkdownExport",
+            "codexAppProjectMove",
+            "codexAppConversationTimeline",
+            "codexAppConversationView",
+            "codexAppThreadScrollRestore",
+            "codexAppZedRemoteOpen",
+            "codexAppUpstreamWorktreeCreate",
+            "codexAppNativeMenuPlacement",
+            "codexAppServiceTierControls",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_bool) {
+                raw.insert(key.to_string(), json!(value));
+            }
         }
         if let Some(value) = payload.get("launchMode").and_then(Value::as_str) {
             raw.insert("launchMode".to_string(), json!(value));
@@ -560,6 +996,10 @@ impl BridgeSettingsService for FakeSettings {
         let updated: BackendSettings = serde_json::from_value(Value::Object(raw.clone())).unwrap();
         *self.settings.lock().unwrap() = updated.clone();
         Ok(updated)
+    }
+
+    async fn codex_app_version(&self) -> anyhow::Result<String> {
+        Ok(self.codex_app_version.lock().unwrap().clone())
     }
 }
 
@@ -591,6 +1031,12 @@ impl BridgeRuntimeService for FakeRuntime {
     async fn set_user_script_enabled(&self, key: String, enabled: bool) -> anyhow::Result<Value> {
         assert_eq!(key, "user:a.js");
         *self.script_enabled.lock().unwrap() = enabled;
+        Ok(self.inventory(false))
+    }
+
+    async fn delete_user_script(&self, key: String) -> anyhow::Result<Value> {
+        assert_eq!(key, "user:a.js");
+        *self.script_enabled.lock().unwrap() = false;
         Ok(self.inventory(false))
     }
 
@@ -665,7 +1111,73 @@ impl BridgeRuntimeService for FakeRuntime {
 
     async fn open_zed_remote(&self, payload: Value) -> anyhow::Result<Value> {
         assert_eq!(payload["path"], json!("/home/app.py"));
-        Ok(json!({"status": "ok", "url": "ssh://example.com/home/app.py"}))
+        Ok(
+            json!({"status": "ok", "url": "ssh://example.com/home/app.py", "strategy": "addToFocusedWorkspace"}),
+        )
+    }
+
+    async fn list_zed_remote_projects(&self, _payload: Value) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "projects": [{
+                "id": "zed-remote-project:test",
+                "label": "sealos-skills",
+                "hostId": "remote-ssh-codex-managed:remote",
+                "ssh": {"user": "longnv", "host": "192.168.100.31", "port": null},
+                "path": "/Users/longnv/bin/repo/sealos-skills",
+                "url": "ssh://longnv@192.168.100.31/Users/longnv/bin/repo/sealos-skills",
+                "source": "codexRemoteProject",
+                "lastOpenedAtMs": null,
+                "isCurrent": false
+            }]
+        }))
+    }
+
+    async fn remember_zed_remote_project(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["path"], json!("/home/app.py"));
+        Ok(json!({"status": "ok", "remembered": true}))
+    }
+
+    async fn forget_zed_remote_project(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["id"], json!("zed-remote-project:test"));
+        Ok(json!({"status": "ok", "removed": 1}))
+    }
+
+    async fn upstream_worktree_status(&self) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "feature": "upstream-worktree"}))
+    }
+
+    async fn upstream_worktree_defaults(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["repoPath"], json!("/repo"));
+        Ok(json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "defaultRemote": "upstream",
+            "defaultBaseBranch": "main",
+        }))
+    }
+
+    async fn upstream_worktree_prepare(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["repoPath"], json!("/repo"));
+        assert_eq!(payload["remote"], json!("upstream"));
+        assert_eq!(payload["baseBranch"], json!("main"));
+        Ok(json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "sourceRef": "upstream/main",
+            "qualifiedSourceRef": "refs/remotes/upstream/main",
+        }))
+    }
+
+    async fn upstream_worktree_create(&self, payload: Value) -> anyhow::Result<Value> {
+        assert_eq!(payload["repoPath"], json!("/repo"));
+        assert_eq!(payload["branchName"], json!("feature/demo"));
+        Ok(json!({
+            "status": "ok",
+            "repoRoot": "/repo",
+            "branchName": "feature/demo",
+            "worktreePath": "/repo-feature-demo",
+        }))
     }
 }
 
@@ -720,6 +1232,32 @@ impl BridgeDataService for FakeData {
             filename: Some("First.md".to_string()),
             markdown: Some("# First\n".to_string()),
         })
+    }
+
+    async fn thread_usage_history(&self, session: SessionRef) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "ok",
+            "session_id": session.session_id,
+            "history": [
+                {
+                    "source": "rollout-history",
+                    "conversation_id": "local:s1",
+                    "turn_id": "turn-1",
+                    "observed_at": "2026-06-02T05:00:00Z",
+                    "usage": {
+                        "inputTokens": 1200,
+                        "outputTokens": 120,
+                        "totalTokens": 1320,
+                        "cachedTokens": 900,
+                        "cacheReadTokens": 0,
+                        "cacheCreationTokens": 0,
+                        "contextUsed": 1320,
+                        "contextLimit": 258400,
+                        "hasBreakdown": true
+                    }
+                }
+            ]
+        }))
     }
 
     async fn find_archived_thread_by_title(
@@ -802,6 +1340,7 @@ impl LaunchHooks for ContextHooks {
         &self,
         _app_dir: &std::path::Path,
         _debug_port: u16,
+        _extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         Ok(CodexLaunch::Process {
             command: vec!["codex".to_string()],
@@ -810,7 +1349,11 @@ impl LaunchHooks for ContextHooks {
         })
     }
 
-    async fn bridge_context(&self, debug_port: u16) -> anyhow::Result<Option<BridgeContext>> {
+    async fn bridge_context(
+        &self,
+        debug_port: u16,
+        _app_dir: &std::path::Path,
+    ) -> anyhow::Result<Option<BridgeContext>> {
         self.event(format!("bridge-context:{debug_port}"));
         Ok(Some(test_context()))
     }

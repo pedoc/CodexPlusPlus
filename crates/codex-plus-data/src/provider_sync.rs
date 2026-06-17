@@ -25,22 +25,105 @@ pub struct ProviderSyncResult {
     pub target_provider: String,
     pub backup_dir: Option<PathBuf>,
     pub changed_session_files: usize,
+    pub skipped_locked_rollout_files: Vec<PathBuf>,
     pub sqlite_rows_updated: usize,
+    pub sqlite_provider_rows_updated: usize,
+    pub sqlite_user_event_rows_updated: usize,
+    pub sqlite_cwd_rows_updated: usize,
+    pub updated_workspace_roots: usize,
+    pub encrypted_content_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSyncTargetSource {
+    Config,
+    Rollout,
+    Sqlite,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSyncTargetOption {
+    pub id: String,
+    pub sources: Vec<ProviderSyncTargetSource>,
+    pub is_current_provider: bool,
+    pub is_manual: bool,
+    pub is_saved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSyncTargetList {
+    pub current_provider: String,
+    pub targets: Vec<ProviderSyncTargetOption>,
 }
 
 #[derive(Debug, Clone)]
 struct SessionChange {
     path: PathBuf,
-    original_first_line: String,
-    next_first_line: String,
-    separator: String,
+    original_text: String,
+    next_text: String,
+    original_session_meta_lines: Vec<String>,
     thread_id: Option<String>,
     cwd: Option<String>,
     has_user_event: bool,
     rewrite_needed: bool,
+    original_mtime: Option<SystemTime>,
+}
+
+#[derive(Debug, Default)]
+struct RolloutRewrite {
+    next_text: String,
+    rewrite_needed: bool,
+    thread_id: Option<String>,
+    cwd: Option<String>,
+    providers: Vec<String>,
+    original_session_meta_lines: Vec<String>,
+    session_meta_count: usize,
+}
+
+#[derive(Debug, Default)]
+struct SessionChanges {
+    changes: Vec<SessionChange>,
+    skipped_locked_rollout_files: Vec<PathBuf>,
+    encrypted_content_counts: HashMap<String, usize>,
+}
+
+#[derive(Debug, Default)]
+struct AppliedSessionChanges {
+    changes: Vec<SessionChange>,
+    skipped_locked_rollout_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct SqliteUpdateCounts {
+    provider_rows: usize,
+    user_event_rows: usize,
+    cwd_rows: usize,
+}
+
+impl SqliteUpdateCounts {
+    fn total(&self) -> usize {
+        self.provider_rows + self.user_event_rows + self.cwd_rows
+    }
+
+    fn add(&mut self, other: Self) {
+        self.provider_rows += other.provider_rows;
+        self.user_event_rows += other.user_event_rows;
+        self.cwd_rows += other.cwd_rows;
+    }
 }
 
 pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
+    run_provider_sync_with_target(codex_home, None)
+}
+
+pub fn run_provider_sync_with_target(
+    codex_home: Option<&Path>,
+    explicit_target_provider: Option<&str>,
+) -> ProviderSyncResult {
     let home = codex_home
         .map(Path::to_path_buf)
         .unwrap_or_else(|| dirs_home().join(".codex"));
@@ -54,7 +137,20 @@ pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
             0,
         );
     }
-    let target_provider = read_current_provider(&home.join("config.toml"));
+    let target_provider =
+        match resolve_target_provider(&home.join("config.toml"), explicit_target_provider) {
+            Ok(provider) => provider,
+            Err(message) => {
+                return result(
+                    ProviderSyncStatus::Skipped,
+                    message,
+                    DEFAULT_PROVIDER,
+                    None,
+                    0,
+                    0,
+                );
+            }
+        };
     let lock_dir = home.join("tmp/provider-sync.lock");
     if acquire_lock(&lock_dir).is_err() {
         return result(
@@ -67,23 +163,29 @@ pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
         );
     }
     let sync_result = (|| -> anyhow::Result<ProviderSyncResult> {
-        let changes = collect_session_changes(&home, &target_provider)?;
-        let rewrite_changes = changes
+        let collected = collect_session_changes(&home, &target_provider)?;
+        let encrypted_content_warning =
+            build_encrypted_content_warning(&collected.encrypted_content_counts, &target_provider);
+        let rewrite_changes = collected
+            .changes
             .iter()
             .filter(|change| change.rewrite_needed)
             .cloned()
             .collect::<Vec<_>>();
-        let thread_ids_with_user_events = changes
+        let thread_ids_with_user_events = collected
+            .changes
             .iter()
             .filter(|change| change.has_user_event)
             .filter_map(|change| change.thread_id.clone())
             .collect::<HashSet<_>>();
-        let cwd_by_thread_id = changes
+        let cwd_by_thread_id = collected
+            .changes
             .iter()
             .filter_map(|change| Some((change.thread_id.clone()?, change.cwd.clone()?)))
             .collect::<HashMap<_, _>>();
-        let sqlite_update_count = count_sqlite_updates(
-            &home.join("state_5.sqlite"),
+        let sqlite_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+        let sqlite_update_count = count_sqlite_updates_for_paths(
+            &sqlite_paths,
             &target_provider,
             &thread_ids_with_user_events,
             &cwd_by_thread_id,
@@ -92,43 +194,59 @@ pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
             count_global_state_updates(&home.join(".codex-global-state.json"))?;
         if rewrite_changes.is_empty() && sqlite_update_count == 0 && global_state_update_count == 0
         {
-            return Ok(result(
+            let mut synced = result(
                 ProviderSyncStatus::Synced,
                 "Provider sync already up to date",
                 &target_provider,
                 None,
                 0,
                 0,
-            ));
+            );
+            synced.skipped_locked_rollout_files = collected.skipped_locked_rollout_files;
+            synced.encrypted_content_warning = encrypted_content_warning;
+            return Ok(synced);
         }
         let backup_dir = create_backup(&home, &target_provider, &rewrite_changes)?;
-        apply_session_changes(&rewrite_changes)?;
-        let apply_result = (|| -> anyhow::Result<usize> {
-            let sqlite_rows_updated = apply_sqlite_update(
-                &home.join("state_5.sqlite"),
+        let applied = apply_session_changes(&rewrite_changes)?;
+        let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize)> {
+            let sqlite_updates = apply_sqlite_update_for_paths(
+                &sqlite_paths,
                 &target_provider,
                 &thread_ids_with_user_events,
                 &cwd_by_thread_id,
             )?;
-            apply_global_state_update(&home.join(".codex-global-state.json"))?;
+            let updated_workspace_roots =
+                apply_global_state_update(&home.join(".codex-global-state.json"))?;
             prune_backups(&home)?;
-            Ok(sqlite_rows_updated)
+            Ok((sqlite_updates, updated_workspace_roots))
         })();
-        let sqlite_rows_updated = match apply_result {
-            Ok(count) => count,
+        let (sqlite_updates, updated_workspace_roots) = match apply_result {
+            Ok(counts) => counts,
             Err(err) => {
-                let _ = restore_session_changes(&rewrite_changes);
+                let _ = restore_session_changes(&applied.changes);
                 return Err(err);
             }
         };
-        Ok(result(
+        let mut synced = result(
             ProviderSyncStatus::Synced,
             "Provider sync complete",
             &target_provider,
             Some(backup_dir),
-            rewrite_changes.len(),
-            sqlite_rows_updated,
-        ))
+            applied.changes.len(),
+            sqlite_updates.total(),
+        );
+        synced.skipped_locked_rollout_files = collected.skipped_locked_rollout_files;
+        synced
+            .skipped_locked_rollout_files
+            .extend(applied.skipped_locked_rollout_files);
+        synced.skipped_locked_rollout_files.sort();
+        synced.skipped_locked_rollout_files.dedup();
+        synced.sqlite_provider_rows_updated = sqlite_updates.provider_rows;
+        synced.sqlite_user_event_rows_updated = sqlite_updates.user_event_rows;
+        synced.sqlite_cwd_rows_updated = sqlite_updates.cwd_rows;
+        synced.updated_workspace_roots = updated_workspace_roots;
+        synced.encrypted_content_warning = encrypted_content_warning;
+        Ok(synced)
     })();
     let _ = release_lock(&lock_dir);
     sync_result.unwrap_or_else(|err| {
@@ -157,7 +275,13 @@ fn result(
         target_provider: target_provider.to_string(),
         backup_dir,
         changed_session_files,
+        skipped_locked_rollout_files: Vec::new(),
         sqlite_rows_updated,
+        sqlite_provider_rows_updated: 0,
+        sqlite_user_event_rows_updated: 0,
+        sqlite_cwd_rows_updated: 0,
+        updated_workspace_roots: 0,
+        encrypted_content_warning: None,
     }
 }
 
@@ -168,28 +292,182 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTargetList {
+    let home = codex_home
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs_home().join(".codex"));
+    let current_provider = read_current_provider(&home.join("config.toml"));
+    let mut sources: HashMap<String, HashSet<ProviderSyncTargetSource>> = HashMap::new();
+
+    fn add_sources(
+        sources: &mut HashMap<String, HashSet<ProviderSyncTargetSource>>,
+        ids: impl IntoIterator<Item = String>,
+        source: ProviderSyncTargetSource,
+    ) {
+        for id in ids {
+            if !is_valid_provider_id_for_discovery(&id) {
+                continue;
+            }
+            sources.entry(id).or_default().insert(source);
+        }
+    }
+
+    add_sources(
+        &mut sources,
+        list_configured_provider_ids(&home.join("config.toml")),
+        ProviderSyncTargetSource::Config,
+    );
+    add_sources(
+        &mut sources,
+        [current_provider.clone()],
+        ProviderSyncTargetSource::Config,
+    );
+    if let Ok(ids) = rollout_provider_ids(&home) {
+        add_sources(&mut sources, ids, ProviderSyncTargetSource::Rollout);
+    }
+    for db_path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home) {
+        if let Ok(ids) = sqlite_provider_ids(&db_path) {
+            add_sources(&mut sources, ids, ProviderSyncTargetSource::Sqlite);
+        }
+    }
+
+    let mut targets = sources
+        .into_iter()
+        .map(|(id, source_set)| {
+            let mut source_list = source_set.into_iter().collect::<Vec<_>>();
+            source_list.sort();
+            ProviderSyncTargetOption {
+                is_current_provider: id == current_provider,
+                is_manual: source_list.contains(&ProviderSyncTargetSource::Manual),
+                is_saved: false,
+                id,
+                sources: source_list,
+            }
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        right
+            .is_current_provider
+            .cmp(&left.is_current_provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    ProviderSyncTargetList {
+        current_provider,
+        targets,
+    }
+}
+
 fn read_current_provider(path: &Path) -> String {
     let Ok(text) = fs::read_to_string(path) else {
         return DEFAULT_PROVIDER.to_string();
     };
+    let provider = root_toml_string_value(&text, "model_provider").unwrap_or_default();
+    if provider.trim().is_empty() {
+        DEFAULT_PROVIDER.to_string()
+    } else {
+        provider
+    }
+}
+
+fn resolve_target_provider(
+    config_path: &Path,
+    explicit_target_provider: Option<&str>,
+) -> Result<String, String> {
+    if let Some(raw) = explicit_target_provider {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(read_current_provider(config_path));
+        }
+        if !is_valid_explicit_provider_id(trimmed) {
+            return Err(format!("Invalid provider sync target: {trimmed:?}"));
+        }
+        return Ok(trimmed.to_string());
+    }
+    Ok(read_current_provider(config_path))
+}
+
+fn is_valid_explicit_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn list_configured_provider_ids(path: &Path) -> Vec<String> {
+    let mut ids = HashSet::new();
+    ids.insert(DEFAULT_PROVIDER.to_string());
+    let Ok(text) = fs::read_to_string(path) else {
+        return sorted_provider_ids(ids);
+    };
     for line in text.lines() {
         let stripped = line.trim();
-        if stripped.starts_with("model_provider") && stripped.contains('=') {
-            let raw = stripped
-                .split_once('=')
-                .map(|(_, value)| value.trim())
-                .unwrap_or("");
-            if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-                let value = &raw[1..raw.len() - 1];
-                return if value.is_empty() {
-                    DEFAULT_PROVIDER.to_string()
-                } else {
-                    value.to_string()
-                };
-            }
+        let Some(section) = stripped
+            .strip_prefix("[model_providers.")
+            .and_then(|rest| rest.strip_suffix(']'))
+        else {
+            continue;
+        };
+        let id = section.trim();
+        if is_valid_provider_id_for_discovery(id) {
+            ids.insert(id.to_string());
         }
     }
-    DEFAULT_PROVIDER.to_string()
+    sorted_provider_ids(ids)
+}
+
+fn sorted_provider_ids(ids: HashSet<String>) -> Vec<String> {
+    let mut ids = ids
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+fn is_valid_provider_id_for_discovery(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+fn root_toml_string_value(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let stripped = line.trim();
+        if stripped.starts_with('[') {
+            break;
+        }
+        let Some(raw) = toml_key_raw_value(stripped, key) else {
+            continue;
+        };
+        return toml_string_value(raw);
+    }
+    None
+}
+
+fn toml_key_raw_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    rest.strip_prefix('=').map(str::trim_start)
+}
+
+fn toml_string_value(raw: &str) -> Option<String> {
+    let quote = raw.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaping = false;
+    for ch in raw[quote.len_utf8()..].chars() {
+        if quote == '"' && escaping {
+            value.push(ch);
+            escaping = false;
+        } else if quote == '"' && ch == '\\' {
+            escaping = true;
+        } else if ch == quote {
+            return Some(value);
+        } else {
+            value.push(ch);
+        }
+    }
+    None
 }
 
 fn acquire_lock(path: &Path) -> std::io::Result<()> {
@@ -208,55 +486,97 @@ fn release_lock(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn collect_session_changes(
-    home: &Path,
-    target_provider: &str,
-) -> anyhow::Result<Vec<SessionChange>> {
-    let mut changes = Vec::new();
+fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result<SessionChanges> {
+    let mut collected = SessionChanges::default();
     for path in rollout_files(home)? {
-        let text = fs::read_to_string(&path)?;
-        let (first_line, separator) = split_first_line(&text);
-        if first_line.trim().is_empty() {
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if is_locked_io_error(&error) => {
+                collected.skipped_locked_rollout_files.push(path);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let rewrite = rewrite_rollout_session_meta_providers(&text, target_provider)?;
+        if rewrite.session_meta_count == 0 {
             continue;
         }
-        let Ok(mut record) = serde_json::from_str::<Value>(&first_line) else {
-            continue;
-        };
-        let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        let thread_id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let cwd = payload
-            .get("cwd")
-            .and_then(Value::as_str)
-            .and_then(to_desktop_workspace_path);
-        let has_user_event =
-            separator.contains("\"user_message\"") || separator.contains("\"user_input\"");
-        let rewrite_needed =
-            payload.get("model_provider").and_then(Value::as_str) != Some(target_provider);
-        if rewrite_needed {
-            payload.insert("model_provider".to_string(), json!(target_provider));
+        let has_user_event = text.contains("\"user_message\"") || text.contains("\"user_input\"");
+        if text.contains("encrypted_content") {
+            for provider in &rewrite.providers {
+                *collected
+                    .encrypted_content_counts
+                    .entry(provider.clone())
+                    .or_insert(0) += 1;
+            }
         }
-        let next_first_line = if rewrite_needed {
-            serde_json::to_string(&record)?
-        } else {
-            first_line.clone()
-        };
-        changes.push(SessionChange {
+        let original_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        collected.changes.push(SessionChange {
             path,
-            original_first_line: first_line,
-            next_first_line,
-            separator,
-            thread_id,
-            cwd,
+            original_text: text,
+            next_text: rewrite.next_text,
+            original_session_meta_lines: rewrite.original_session_meta_lines,
+            thread_id: rewrite.thread_id,
+            cwd: rewrite.cwd,
             has_user_event,
-            rewrite_needed,
+            rewrite_needed: rewrite.rewrite_needed,
+            original_mtime,
         });
     }
-    Ok(changes)
+    Ok(collected)
+}
+
+fn rewrite_rollout_session_meta_providers(
+    text: &str,
+    target_provider: &str,
+) -> anyhow::Result<RolloutRewrite> {
+    let mut rewrite = RolloutRewrite::default();
+    for segment in text.split_inclusive('\n') {
+        let (line, line_ending) = split_line_ending(segment);
+        let mut next_line = line.to_string();
+        if !line.trim().is_empty() {
+            if let Ok(mut record) = serde_json::from_str::<Value>(line) {
+                if record.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut)
+                    else {
+                        rewrite.next_text.push_str(&next_line);
+                        rewrite.next_text.push_str(line_ending);
+                        continue;
+                    };
+                    rewrite.session_meta_count += 1;
+                    rewrite.original_session_meta_lines.push(line.to_string());
+                    if rewrite.thread_id.is_none() {
+                        rewrite.thread_id = payload
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string);
+                    }
+                    if rewrite.cwd.is_none() {
+                        rewrite.cwd = payload
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .and_then(to_desktop_workspace_path);
+                    }
+                    let provider = payload
+                        .get("model_provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(missing)")
+                        .to_string();
+                    rewrite.providers.push(provider);
+                    if payload.get("model_provider").and_then(Value::as_str)
+                        != Some(target_provider)
+                    {
+                        payload.insert("model_provider".to_string(), json!(target_provider));
+                        next_line = serde_json::to_string(&record)?;
+                        rewrite.rewrite_needed = true;
+                    }
+                }
+            }
+        }
+        rewrite.next_text.push_str(&next_line);
+        rewrite.next_text.push_str(line_ending);
+    }
+    Ok(rewrite)
 }
 
 fn rollout_files(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -269,6 +589,38 @@ fn rollout_files(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn rollout_provider_ids(home: &Path) -> anyhow::Result<Vec<String>> {
+    let mut ids = HashSet::new();
+    for path in rollout_files(home)? {
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if is_locked_io_error(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for segment in text.split_inclusive('\n') {
+            let (line, _) = split_line_ending(segment);
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+                continue;
+            }
+            let Some(provider) = record
+                .get("payload")
+                .and_then(Value::as_object)
+                .and_then(|payload| payload.get("model_provider"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if is_valid_provider_id_for_discovery(provider) {
+                ids.insert(provider.to_string());
+            }
+        }
+    }
+    Ok(sorted_provider_ids(ids))
 }
 
 fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -287,11 +639,13 @@ fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> anyhow::Resul
     Ok(())
 }
 
-fn split_first_line(text: &str) -> (String, String) {
-    if let Some(index) = text.find('\n') {
-        (text[..index].to_string(), text[index..].to_string())
+fn split_line_ending(segment: &str) -> (&str, &str) {
+    if let Some(line) = segment.strip_suffix("\r\n") {
+        (line, "\r\n")
+    } else if let Some(line) = segment.strip_suffix('\n') {
+        (line, "\n")
     } else {
-        (text.to_string(), String::new())
+        (segment, "")
     }
 }
 
@@ -308,6 +662,30 @@ fn to_desktop_workspace_path(value: &str) -> Option<String> {
         return Some(stripped[4..].replace('\\', "/"));
     }
     Some(stripped.to_string())
+}
+
+fn is_locked_io_error(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::PermissionDenied)
+        || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn build_encrypted_content_warning(
+    encrypted_content_counts: &HashMap<String, usize>,
+    target_provider: &str,
+) -> Option<String> {
+    let risky_providers = encrypted_content_counts
+        .iter()
+        .filter(|(provider, count)| provider.as_str() != target_provider && **count > 0)
+        .map(|(provider, _)| provider.as_str())
+        .collect::<Vec<_>>();
+    if risky_providers.is_empty() {
+        return None;
+    }
+    let total = encrypted_content_counts.values().sum::<usize>();
+    Some(format!(
+        "检测到 {total} 个会话文件包含来自 {} 的 encrypted_content。可见会话元数据已同步到 {target_provider}，但继续或压缩这些历史可能出现 invalid_encrypted_content；需要可靠续聊时请切回原供应商/账号或开启新会话。",
+        risky_providers.join(", ")
+    ))
 }
 
 fn create_backup(
@@ -334,11 +712,19 @@ fn create_backup(
         }
     }
     let db_dir = backup_dir.join("db");
-    for name in ["state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm"] {
-        let source = home.join(name);
-        if source.exists() {
-            fs::create_dir_all(&db_dir)?;
-            fs::copy(&source, db_dir.join(name))?;
+    let mut db_files = Vec::new();
+    for db_path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(home) {
+        for source in codex_plus_core::codex_sqlite::codex_sqlite_sidecar_paths(&db_path) {
+            if !source.exists() {
+                continue;
+            }
+            let relative = codex_plus_core::codex_sqlite::relative_to_codex_home(home, &source);
+            let target = db_dir.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &target)?;
+            db_files.push(relative.to_string_lossy().replace('\\', "/"));
         }
     }
     let manifest = changes
@@ -346,8 +732,7 @@ fn create_backup(
         .map(|change| {
             json!({
                 "path": change.path.to_string_lossy(),
-                "originalFirstLine": change.original_first_line,
-                "separator": change.separator,
+                "originalSessionMetaLines": change.original_session_meta_lines,
             })
         })
         .collect::<Vec<_>>();
@@ -357,31 +742,54 @@ fn create_backup(
     )?;
     fs::write(
         backup_dir.join("metadata.json"),
-        serde_json::to_string_pretty(
-            &json!({"managedBy": "Codex++ provider sync", "targetProvider": target_provider}),
-        )?,
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "namespace": "provider-sync",
+            "codexHome": home.to_string_lossy(),
+            "targetProvider": target_provider,
+            "createdAt": chrono::Utc::now().to_rfc3339(),
+            "dbFiles": db_files,
+            "changedSessionFiles": changes.len(),
+            "managedBy": "Codex++ provider sync"
+        }))?,
     )?;
     Ok(backup_dir)
 }
 
-fn apply_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
+fn apply_session_changes(changes: &[SessionChange]) -> anyhow::Result<AppliedSessionChanges> {
+    let mut applied = AppliedSessionChanges::default();
     for change in changes {
-        fs::write(
-            &change.path,
-            format!("{}{}", change.next_first_line, change.separator),
-        )?;
+        match fs::write(&change.path, &change.next_text) {
+            Ok(()) => {}
+            Err(error) if is_locked_io_error(&error) => {
+                applied
+                    .skipped_locked_rollout_files
+                    .push(change.path.clone());
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        restore_file_mtime(&change.path, change.original_mtime);
+        applied.changes.push(change.clone());
     }
-    Ok(())
+    Ok(applied)
 }
 
 fn restore_session_changes(changes: &[SessionChange]) -> anyhow::Result<()> {
     for change in changes {
-        fs::write(
-            &change.path,
-            format!("{}{}", change.original_first_line, change.separator),
-        )?;
+        fs::write(&change.path, &change.original_text)?;
+        restore_file_mtime(&change.path, change.original_mtime);
     }
     Ok(())
+}
+
+fn restore_file_mtime(path: &Path, mtime: Option<SystemTime>) {
+    let Some(mtime) = mtime else { return };
+    let Ok(file) = fs::File::options().write(true).open(path) else {
+        return;
+    };
+    let times = std::fs::FileTimes::new().set_modified(mtime);
+    let _ = file.set_times(times);
 }
 
 fn table_columns(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>> {
@@ -392,6 +800,28 @@ fn table_columns(db: &Connection, table: &str) -> anyhow::Result<HashSet<String>
     Ok(stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<HashSet<_>>>()?)
+}
+
+fn sqlite_provider_ids(path: &Path) -> anyhow::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let db = Connection::open(path)?;
+    let columns = table_columns(&db, "threads")?;
+    if !columns.contains("model_provider") {
+        return Ok(Vec::new());
+    }
+    let mut stmt = db.prepare(
+        "SELECT DISTINCT COALESCE(model_provider, '') FROM threads WHERE COALESCE(model_provider, '') <> ''",
+    )?;
+    let mut ids = HashSet::new();
+    for item in stmt.query_map([], |row| row.get::<_, String>(0))? {
+        let id = item?;
+        if is_valid_provider_id_for_discovery(&id) {
+            ids.insert(id);
+        }
+    }
+    Ok(sorted_provider_ids(ids))
 }
 
 fn count_sqlite_updates(
@@ -434,28 +864,47 @@ fn count_sqlite_updates(
     Ok(total)
 }
 
+fn count_sqlite_updates_for_paths(
+    paths: &[PathBuf],
+    target_provider: &str,
+    user_event_thread_ids: &HashSet<String>,
+    cwd_by_thread_id: &HashMap<String, String>,
+) -> anyhow::Result<usize> {
+    let mut total = 0;
+    for path in paths {
+        total += count_sqlite_updates(
+            path,
+            target_provider,
+            user_event_thread_ids,
+            cwd_by_thread_id,
+        )?;
+    }
+    Ok(total)
+}
+
 fn apply_sqlite_update(
     path: &Path,
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
     cwd_by_thread_id: &HashMap<String, String>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<SqliteUpdateCounts> {
     if !path.exists() {
-        return Ok(0);
+        return Ok(SqliteUpdateCounts::default());
     }
     let mut db = Connection::open(path)?;
     let columns = table_columns(&db, "threads")?;
     if !columns.contains("model_provider") {
-        return Ok(0);
+        return Ok(SqliteUpdateCounts::default());
     }
     let tx = db.transaction()?;
-    let provider_rows = tx.execute(
+    let mut counts = SqliteUpdateCounts::default();
+    counts.provider_rows = tx.execute(
         "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
         [target_provider],
     )?;
     if columns.contains("has_user_event") {
         for thread_id in user_event_thread_ids {
-            tx.execute(
+            counts.user_event_rows += tx.execute(
                 "UPDATE threads SET has_user_event = 1 WHERE id = ?1 AND COALESCE(has_user_event, 0) <> 1",
                 [thread_id],
             )?;
@@ -463,14 +912,32 @@ fn apply_sqlite_update(
     }
     if columns.contains("cwd") {
         for (thread_id, cwd) in cwd_by_thread_id {
-            tx.execute(
+            counts.cwd_rows += tx.execute(
                 "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
                 (cwd, thread_id),
             )?;
         }
     }
     tx.commit()?;
-    Ok(provider_rows)
+    Ok(counts)
+}
+
+fn apply_sqlite_update_for_paths(
+    paths: &[PathBuf],
+    target_provider: &str,
+    user_event_thread_ids: &HashSet<String>,
+    cwd_by_thread_id: &HashMap<String, String>,
+) -> anyhow::Result<SqliteUpdateCounts> {
+    let mut total = SqliteUpdateCounts::default();
+    for path in paths {
+        total.add(apply_sqlite_update(
+            path,
+            target_provider,
+            user_event_thread_ids,
+            cwd_by_thread_id,
+        )?);
+    }
+    Ok(total)
 }
 
 fn load_global_state(path: &Path) -> anyhow::Result<Map<String, Value>> {
@@ -524,7 +991,34 @@ fn normalized_global_state(state: &Map<String, Value>) -> Map<String, Value> {
             Value::Object(labels),
         );
     }
+    if let Some(open_targets) = state
+        .get("open-in-target-preferences")
+        .and_then(Value::as_object)
+    {
+        let mut next_open_targets = open_targets.clone();
+        if let Some(per_path) =
+            copy_resolved_object_keys(open_targets.get("perPath").and_then(Value::as_object))
+        {
+            next_open_targets.insert("perPath".to_string(), Value::Object(per_path));
+        }
+        next.insert(
+            "open-in-target-preferences".to_string(),
+            Value::Object(next_open_targets),
+        );
+    }
     next
+}
+
+fn copy_resolved_object_keys(value: Option<&Map<String, Value>>) -> Option<Map<String, Value>> {
+    let value = value?;
+    let mut next = Map::new();
+    for (key, item) in value {
+        next.insert(
+            to_desktop_workspace_path(key).unwrap_or_else(|| key.clone()),
+            item.clone(),
+        );
+    }
+    Some(next)
 }
 
 fn count_global_state_updates(path: &Path) -> anyhow::Result<usize> {
@@ -547,7 +1041,11 @@ fn apply_global_state_update(path: &Path) -> anyhow::Result<usize> {
         for (key, value) in next {
             state.insert(key, value);
         }
-        fs::write(path, serde_json::to_string_pretty(&Value::Object(state))?)?;
+        let text = serde_json::to_string_pretty(&Value::Object(state))?;
+        fs::write(path, &text)?;
+        if let Some(parent) = path.parent() {
+            fs::write(parent.join(".codex-global-state.json.bak"), text)?;
+        }
     }
     Ok(count)
 }

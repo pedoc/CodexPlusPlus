@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -7,13 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::settings::{BackendSettings, SettingsStore};
+use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
 use crate::status::{LaunchStatus, StatusStore};
+
+#[cfg(windows)]
+const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 180, 240, 300];
+#[cfg_attr(not(windows), allow(dead_code))]
+const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexLaunch {
@@ -124,11 +129,23 @@ pub trait LaunchHooks: Send + Sync {
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
+    async fn apply_active_relay_profile(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
-    async fn launch_codex(&self, app_dir: &Path, debug_port: u16) -> anyhow::Result<CodexLaunch>;
+    async fn launch_codex(
+        &self,
+        app_dir: &Path,
+        debug_port: u16,
+        extra_args: &[String],
+    ) -> anyhow::Result<CodexLaunch>;
     async fn bridge_context(
         &self,
         _debug_port: u16,
+        _app_dir: &Path,
     ) -> anyhow::Result<Option<crate::routes::BridgeContext>> {
         Ok(None)
     }
@@ -141,10 +158,41 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         self.inject(debug_port, helper_port).await
     }
+    async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
+        for attempt in 1..=120 {
+            let result = match self.bridge_context(debug_port, app_dir).await {
+                Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
+                Ok(None) => self.inject(debug_port, helper_port).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => return true,
+                Err(error) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.ensure_injection_retry_failed",
+                        serde_json::json!({
+                            "debug_port": debug_port,
+                            "helper_port": helper_port,
+                            "attempt": attempt,
+                            "message": error.to_string()
+                        }),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+        false
+    }
     async fn start_bridge_watchdog(
         &self,
         _debug_port: u16,
         _helper_port: u16,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn start_computer_use_guard_watchdog(
+        &self,
+        _settings: &BackendSettings,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -159,6 +207,8 @@ pub struct DefaultLaunchHooks {
     child: Mutex<Option<Child>>,
     helper: Mutex<Option<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
+    computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
+    computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
 }
 
 struct HelperRuntime {
@@ -167,6 +217,11 @@ struct HelperRuntime {
 }
 
 struct BridgeWatchdogRuntime {
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct ComputerUseGuardWatchdogRuntime {
     shutdown: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -184,43 +239,72 @@ where
 {
     let hooks = hooks.into_launch_hooks();
     let debug_port = hooks.select_debug_port(options.debug_port);
-    let helper_port = hooks.select_helper_port(options.helper_port);
+    let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
     let status_store = options.status_store.clone();
     let mut helper_started = false;
     let mut launched = None;
+    let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
         if settings.provider_sync_enabled {
             hooks.run_provider_sync().await?;
         }
-
-        if settings.enhancements_enabled {
+        if settings.computer_use_guard_enabled {
+            hooks.ensure_computer_use_config(&settings).await?;
+        }
+        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
+        if protocol_proxy_enabled {
+            helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+        }
+        if settings.enhancements_enabled || protocol_proxy_enabled {
             hooks.start_helper(helper_port).await?;
             helper_started = true;
         }
 
-        let launch = hooks.launch_codex(&app_dir, debug_port).await?;
+        let launch = hooks
+            .launch_codex(&app_dir, debug_port, &settings.codex_extra_args)
+            .await?;
         launched = Some(launch.clone());
-
-        if settings.enhancements_enabled {
-            match hooks.bridge_context(debug_port).await? {
-                Some(ctx) => hooks.inject_bridge(debug_port, helper_port, ctx).await?,
-                None => hooks.inject(debug_port, helper_port).await?,
-            }
-            hooks.start_bridge_watchdog(debug_port, helper_port).await?;
+        keep_launched_on_error = true;
+        if settings.computer_use_guard_enabled {
+            hooks.start_computer_use_guard_watchdog(&settings).await?;
         }
 
-        let status = launch_status(
-            "running",
-            "Codex++ launcher ready",
-            debug_port,
-            helper_port,
-            &app_dir,
-        );
-        options.status_store.save_latest(&status)?;
-        hooks.write_status("running").await;
+        let mut injection_degraded = false;
+        if settings.enhancements_enabled {
+            let injection_ready = hooks
+                .ensure_injection(debug_port, helper_port, &app_dir)
+                .await;
+            if injection_ready {
+                keep_launched_on_error = false;
+                hooks.start_bridge_watchdog(debug_port, helper_port).await?;
+            } else {
+                let degraded = launch_status(
+                    "running_degraded",
+                    "Codex launched; Codex++ enhancements are still waiting for the page bridge.",
+                    debug_port,
+                    helper_port,
+                    &app_dir,
+                );
+                options.status_store.save_latest(&degraded)?;
+                hooks.write_status("running_degraded").await;
+                injection_degraded = true;
+            }
+        }
+
+        if !settings.enhancements_enabled || !injection_degraded {
+            let status = launch_status(
+                "running",
+                "Codex++ launcher ready",
+                debug_port,
+                helper_port,
+                &app_dir,
+            );
+            options.status_store.save_latest(&status)?;
+            hooks.write_status("running").await;
+        }
 
         Ok(LaunchHandle {
             debug_port,
@@ -241,7 +325,9 @@ where
                 hooks.shutdown_helper(helper_port).await;
             }
             if let Some(launch) = &launched {
-                hooks.terminate_codex(launch).await;
+                if !keep_launched_on_error {
+                    hooks.terminate_codex(launch).await;
+                }
             }
             let message = error.to_string();
             let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
@@ -250,6 +336,10 @@ where
             Err(error)
         }
     }
+}
+
+fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
+    settings.active_relay_profile().protocol == crate::settings::RelayProtocol::ChatCompletions
 }
 
 pub trait IntoLaunchHooks {
@@ -298,7 +388,7 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     fn select_debug_port(&self, requested: u16) -> u16 {
-        crate::ports::select_platform_loopback_port(requested)
+        crate::ports::select_packaged_codex_debug_port(requested)
     }
 
     fn select_helper_port(&self, requested: u16) -> u16 {
@@ -311,6 +401,55 @@ impl LaunchHooks for DefaultLaunchHooks {
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         anyhow::bail!("provider sync requires launcher hooks with codex-plus-data integration")
+    }
+
+    async fn apply_active_relay_profile(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        if !settings.relay_profiles_enabled {
+            return Ok(());
+        }
+        let profile = settings.active_relay_profile();
+        let home = crate::relay_config::default_codex_home_dir();
+        let common_config = crate::relay_config::normalize_config_text(
+            &[
+                settings.relay_common_config_contents.as_str(),
+                settings.relay_context_config_contents.as_str(),
+            ]
+            .into_iter()
+            .map(str::trim)
+            .filter(|section| !section.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        );
+        if profile.relay_mode == crate::settings::RelayMode::Official
+            && !profile.official_mix_api_key
+        {
+            let auth_contents = (!profile.auth_contents.trim().is_empty())
+                .then_some(profile.auth_contents.as_str());
+            crate::relay_config::clear_relay_config_to_home_with_auth_and_computer_use_guard(
+                &home,
+                auth_contents,
+                settings.computer_use_guard_enabled,
+            )?;
+            return Ok(());
+        }
+        crate::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
+            &home,
+            &profile,
+            &common_config,
+            settings.computer_use_guard_enabled,
+        )?;
+        Ok(())
+    }
+
+    async fn ensure_computer_use_config(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        if !settings.computer_use_guard_enabled {
+            return Ok(());
+        }
+        let home = crate::relay_config::default_codex_home_dir();
+        let artifacts = crate::computer_use_guard::resolve_computer_use_guard_artifacts(&home)?;
+        crate::computer_use_guard::ensure_computer_use_config_with_artifacts(&home, &artifacts)?;
+        *self.computer_use_guard_artifacts.lock().await = Some(artifacts);
+        Ok(())
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
@@ -346,9 +485,14 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn launch_codex(&self, app_dir: &Path, debug_port: u16) -> anyhow::Result<CodexLaunch> {
+    async fn launch_codex(
+        &self,
+        app_dir: &Path,
+        debug_port: u16,
+        extra_args: &[String],
+    ) -> anyhow::Result<CodexLaunch> {
         if cfg!(windows) {
-            if let Some(activation) = build_packaged_activation(app_dir, debug_port) {
+            if let Some(activation) = build_packaged_activation(app_dir, debug_port, extra_args) {
                 let CodexLaunch::PackagedActivation {
                     app_user_model_id,
                     arguments,
@@ -357,10 +501,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                 else {
                     unreachable!();
                 };
-                let env = codex_process_environment();
-                let process_id =
-                    activate_packaged_app_with_environment(app_user_model_id, arguments, &env)
-                        .await?;
+                let process_id = activate_packaged_app(app_user_model_id, arguments).await?;
                 return Ok(match activation {
                     CodexLaunch::PackagedActivation {
                         app_user_model_id,
@@ -382,13 +523,12 @@ impl LaunchHooks for DefaultLaunchHooks {
             } else {
                 MacosCleanupPolicy::QuitIfNotPreviouslyRunning
             };
-            let command = build_macos_open_command(app_dir, debug_port);
+            let command = build_macos_open_command(app_dir, debug_port, extra_args);
             let executable = command
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("macOS open command is empty"))?;
             let child = Command::new(executable)
                 .args(&command[1..])
-                .envs(codex_process_environment())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -401,14 +541,13 @@ impl LaunchHooks for DefaultLaunchHooks {
             });
         }
 
-        let command = build_codex_command(app_dir, debug_port);
+        let command = build_codex_command(app_dir, debug_port, extra_args);
         let executable = command
             .first()
             .ok_or_else(|| anyhow::anyhow!("Codex command is empty"))?;
         let mut child_command = Command::new(executable);
         child_command
             .args(&command[1..])
-            .envs(codex_process_environment())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(windows)]
@@ -453,6 +592,34 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
+    async fn start_computer_use_guard_watchdog(
+        &self,
+        settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
+        if !settings.computer_use_guard_enabled {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let home = crate::relay_config::default_codex_home_dir();
+            let artifacts = self.computer_use_guard_artifacts.lock().await.clone();
+            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                run_post_launch_computer_use_guard(home, artifacts, &mut shutdown_rx).await;
+            });
+            if let Some(runtime) = self
+                .computer_use_guard_watchdog
+                .lock()
+                .await
+                .replace(ComputerUseGuardWatchdogRuntime { shutdown, task })
+            {
+                let _ = runtime.shutdown.send(());
+                let _ = runtime.task.await;
+            }
+        }
+        Ok(())
+    }
+
     async fn write_status(&self, _status: &str) {}
 
     async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()> {
@@ -473,6 +640,10 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn shutdown_helper(&self, _helper_port: u16) {
+        if let Some(runtime) = self.computer_use_guard_watchdog.lock().await.take() {
+            let _ = runtime.shutdown.send(());
+            let _ = runtime.task.await;
+        }
         if let Some(runtime) = self.bridge_watchdog.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
@@ -522,13 +693,13 @@ async fn handle_helper_connection(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
-    let mut buffer = vec![0_u8; 4096];
-    let read = stream.read(&mut buffer).await?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let request_bytes = read_http_request(&mut stream).await?;
+    let request = String::from_utf8_lossy(&request_bytes);
     let request_line = request.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
+    let raw_path = parts.next().unwrap_or_default();
+    let path = raw_path.split('?').next().unwrap_or(raw_path);
     let request_body = http_request_body(&request);
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
@@ -543,58 +714,99 @@ async fn handle_helper_connection(
         }),
     );
 
-    let (status, body, log_event) = if matches!(path, "/backend/status" | "/backend/repair")
-        && matches!(method, "GET" | "POST" | "OPTIONS")
-    {
-        (
-            "200 OK",
-            serde_json::to_vec(&serde_json::json!({
-                "status": "ok",
-                "message": "后端已连接",
-                "version": crate::version::VERSION,
-                "transport": "http-helper"
-            }))?,
-            if path == "/backend/status" {
-                "helper.backend_status_ok"
+    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
+        return handle_protocol_proxy_connection(
+            &mut stream,
+            request_body,
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
+    if crate::protocol_proxy::is_chat_completions_proxy_path(path) && method == "POST" {
+        return handle_chat_completions_proxy_connection(
+            &mut stream,
+            request_body,
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
+    if crate::protocol_proxy::is_models_proxy_path(path) && matches!(method, "GET" | "OPTIONS") {
+        return handle_models_proxy_connection(&mut stream, method, path, remote_addr_text).await;
+    }
+
+    let (status, body, content_type, log_event) =
+        if matches!(path, "/backend/status" | "/backend/repair")
+            && matches!(method, "GET" | "POST" | "OPTIONS")
+        {
+            (
+                "200 OK".to_string(),
+                serde_json::to_vec(&serde_json::json!({
+                    "status": "ok",
+                    "message": "后端已连接",
+                    "version": crate::version::VERSION,
+                    "transport": "http-helper"
+                }))?,
+                "application/json; charset=utf-8".to_string(),
+                if path == "/backend/status" {
+                    "helper.backend_status_ok"
+                } else {
+                    "helper.backend_repair_ok"
+                },
+            )
+        } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
+            if method == "POST" {
+                let detail = serde_json::from_str::<serde_json::Value>(request_body)
+                    .unwrap_or_else(|error| {
+                        serde_json::json!({
+                            "parse_error": error.to_string(),
+                            "raw": request_body
+                        })
+                    });
+                let event = detail
+                    .get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .map(sanitize_diagnostic_event)
+                    .unwrap_or_else(|| "event".to_string());
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    &format!("renderer.{event}"),
+                    detail,
+                );
+            }
+            (
+                "200 OK".to_string(),
+                serde_json::to_vec(&serde_json::json!({
+                    "status": "ok",
+                    "message": "日志已记录"
+                }))?,
+                "application/json; charset=utf-8".to_string(),
+                "helper.diagnostics_log_ok",
+            )
+        } else if path == "/overlay/image" && matches!(method, "GET" | "OPTIONS") {
+            if method == "OPTIONS" {
+                (
+                    "200 OK".to_string(),
+                    Vec::new(),
+                    "application/octet-stream".to_string(),
+                    "helper.overlay_image_options",
+                )
             } else {
-                "helper.backend_repair_ok"
-            },
-        )
-    } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
-        if method == "POST" {
-            let detail =
-                serde_json::from_str::<serde_json::Value>(request_body).unwrap_or_else(|error| {
-                    serde_json::json!({
-                        "parse_error": error.to_string(),
-                        "raw": request_body
-                    })
-                });
-            let event = detail
-                .get("event")
-                .and_then(serde_json::Value::as_str)
-                .map(sanitize_diagnostic_event)
-                .unwrap_or_else(|| "event".to_string());
-            let _ =
-                crate::diagnostic_log::append_diagnostic_log(&format!("renderer.{event}"), detail);
-        }
-        (
-            "200 OK",
-            serde_json::to_vec(&serde_json::json!({
-                "status": "ok",
-                "message": "日志已记录"
-            }))?,
-            "helper.diagnostics_log_ok",
-        )
-    } else {
-        (
-            "404 Not Found",
-            serde_json::to_vec(&serde_json::json!({
-                "status": "failed",
-                "message": "未知后端路径"
-            }))?,
-            "helper.unknown_path",
-        )
-    };
+                overlay_image_response()
+            }
+        } else {
+            (
+                "404 Not Found".to_string(),
+                serde_json::to_vec(&serde_json::json!({
+                    "status": "failed",
+                    "message": "未知后端路径"
+                }))?,
+                "application/json; charset=utf-8".to_string(),
+                "helper.unknown_path",
+            )
+        };
     let _ = crate::diagnostic_log::append_diagnostic_log(
         log_event,
         serde_json::json!({
@@ -606,11 +818,11 @@ async fn handle_helper_connection(
     );
     let response = if method == "OPTIONS" {
         format!(
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         )
     } else {
         format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
     };
@@ -620,6 +832,440 @@ async fn handle_helper_connection(
     }
     stream.shutdown().await?;
     Ok(())
+}
+
+fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
+    let not_found = || {
+        (
+            "404 Not Found".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": "图片覆盖层未启用或图片不可用"
+            }))
+            .unwrap_or_default(),
+            "application/json; charset=utf-8".to_string(),
+            "helper.overlay_image_not_found",
+        )
+    };
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    if !settings.codex_app_image_overlay_enabled {
+        return not_found();
+    }
+    let image_path = PathBuf::from(settings.codex_app_image_overlay_path.trim());
+    if image_path.as_os_str().is_empty() || !image_path.is_file() {
+        return not_found();
+    }
+    let Some(content_type) = overlay_image_content_type(&image_path) else {
+        return not_found();
+    };
+    match std::fs::read(&image_path) {
+        Ok(bytes) => (
+            "200 OK".to_string(),
+            bytes,
+            content_type.to_string(),
+            "helper.overlay_image_ok",
+        ),
+        Err(_) => not_found(),
+    }
+}
+
+fn overlay_image_content_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        Some("bmp") => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+async fn handle_models_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    if method == "OPTIONS" {
+        write_http_response(
+            stream,
+            "204 No Content",
+            "application/json; charset=utf-8",
+            &[],
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let upstream = match crate::protocol_proxy::open_models_proxy_request().await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.models_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+
+    let status = upstream.status();
+    let is_success = upstream.is_success();
+    let content_type = if upstream.content_type.is_empty() {
+        "application/json; charset=utf-8".to_string()
+    } else {
+        upstream.content_type.clone()
+    };
+    let body = upstream.response.bytes().await?.to_vec();
+    write_http_response(stream, &status, &content_type, &body).await?;
+    log_helper_response(
+        if is_success {
+            "helper.models_proxy_ok"
+        } else {
+            "helper.models_proxy_upstream_error"
+        },
+        method,
+        path,
+        &status,
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn handle_protocol_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &str,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
+    let upstream = match crate::protocol_proxy::open_responses_proxy_request(request_body).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.protocol_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+
+    if !upstream.is_success() {
+        let status = upstream.status();
+        let upstream_content_type = upstream.content_type.clone();
+        let upstream_body = upstream.response.bytes().await?.to_vec();
+        let error = crate::protocol_proxy::responses_error_from_upstream(
+            upstream.status_code,
+            &upstream_content_type,
+            &upstream_body,
+        );
+        let body = serde_json::to_vec(&error)?;
+        write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
+        log_helper_response(
+            "helper.protocol_proxy_upstream_error",
+            method,
+            path,
+            &status,
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    if upstream.is_stream {
+        write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+        let mut converter = request_json
+            .as_ref()
+            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
+            .unwrap_or_default();
+        let mut bytes_stream = upstream.response.bytes_stream();
+        let mut stream_failed = false;
+
+        while let Some(chunk) = bytes_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let converted = converter.push_bytes(&bytes);
+                    if !converted.is_empty() {
+                        stream.write_all(&converted).await?;
+                    }
+                }
+                Err(error) => {
+                    let failed = converter.fail(
+                        format!("Stream error: {error}"),
+                        Some("stream_error".to_string()),
+                    );
+                    if !failed.is_empty() {
+                        stream.write_all(&failed).await?;
+                    }
+                    stream_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if !stream_failed {
+            let tail = converter.finish();
+            if !tail.is_empty() {
+                stream.write_all(&tail).await?;
+            }
+        }
+        log_helper_response(
+            "helper.protocol_proxy_stream_ok",
+            method,
+            path,
+            "200 OK",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let upstream_body = upstream.response.bytes().await?;
+    let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
+    let response_json = if let Some(request_json) = request_json.as_ref() {
+        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
+    } else {
+        crate::protocol_proxy::chat_completion_to_response(chat_json)?
+    };
+    let body = serde_json::to_vec(&response_json)?;
+    write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
+    log_helper_response(
+        "helper.protocol_proxy_ok",
+        method,
+        path,
+        "200 OK",
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn handle_chat_completions_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &str,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let upstream =
+        match crate::protocol_proxy::open_chat_completions_proxy_request(request_body).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "status": "failed",
+                    "message": error.to_string()
+                }))?;
+                write_http_response(
+                    stream,
+                    "502 Bad Gateway",
+                    "application/json; charset=utf-8",
+                    &body,
+                )
+                .await?;
+                log_helper_response(
+                    "helper.chat_completions_proxy_failed",
+                    method,
+                    path,
+                    "502 Bad Gateway",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        };
+
+    let status = upstream.status();
+    let is_success = upstream.is_success();
+    let content_type = if upstream.content_type.is_empty() {
+        "application/json; charset=utf-8".to_string()
+    } else {
+        upstream.content_type.clone()
+    };
+
+    if upstream.is_stream && is_success {
+        write_http_stream_headers(stream, &status, &content_type).await?;
+        let mut bytes_stream = upstream.response.bytes_stream();
+        while let Some(chunk) = bytes_stream.next().await {
+            stream.write_all(&chunk?).await?;
+        }
+        log_helper_response(
+            "helper.chat_completions_proxy_stream_ok",
+            method,
+            path,
+            &status,
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let body = upstream.response.bytes().await?.to_vec();
+    write_http_response(stream, &status, &content_type, &body).await?;
+    log_helper_response(
+        if is_success {
+            "helper.chat_completions_proxy_ok"
+        } else {
+            "helper.chat_completions_proxy_upstream_error"
+        },
+        method,
+        path,
+        &status,
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await?;
+    Ok(())
+}
+
+async fn write_http_stream_headers(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+) -> anyhow::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+fn log_helper_response(
+    event: &str,
+    method: &str,
+    path: &str,
+    status: &str,
+    remote_addr_text: Option<String>,
+) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        event,
+        serde_json::json!({
+            "method": method,
+            "path": path,
+            "status": status,
+            "remote_addr": remote_addr_text
+        }),
+    );
+}
+
+#[cfg(test)]
+mod computer_use_tests {
+    use super::overlay_image_content_type;
+    use std::path::Path;
+
+    #[test]
+    fn overlay_image_content_type_accepts_common_images_only() {
+        assert_eq!(
+            overlay_image_content_type(Path::new("overlay.PNG")),
+            Some("image/png")
+        );
+        assert_eq!(
+            overlay_image_content_type(Path::new("overlay.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            overlay_image_content_type(Path::new("overlay.webp")),
+            Some("image/webp")
+        );
+        assert_eq!(overlay_image_content_type(Path::new("overlay.txt")), None);
+    }
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    let mut chunk = vec![0_u8; 4096];
+    let mut header_end = None;
+    let mut content_length = 0_usize;
+
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if header_end.is_none() {
+            header_end = find_header_end(&buffer);
+            if let Some(end) = header_end {
+                content_length = content_length_from_headers(&buffer[..end]).unwrap_or(0);
+            }
+        }
+        if let Some(end) = header_end {
+            if buffer.len() >= end + 4 + content_length {
+                break;
+            }
+        }
+        if buffer.len() > 32 * 1024 * 1024 {
+            anyhow::bail!("HTTP 请求过大");
+        }
+    }
+
+    Ok(buffer)
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn content_length_from_headers(headers: &[u8]) -> Option<usize> {
+    let text = String::from_utf8_lossy(headers);
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn http_request_body(request: &str) -> &str {
@@ -647,52 +1293,35 @@ fn sanitize_diagnostic_event(event: &str) -> String {
     }
 }
 
-pub fn build_codex_arguments(debug_port: u16) -> Vec<String> {
-    vec![
+pub fn build_codex_arguments(debug_port: u16, extra_args: &[String]) -> Vec<String> {
+    let mut args = vec![
         format!("--remote-debugging-port={debug_port}"),
         format!("--remote-allow-origins=http://127.0.0.1:{debug_port}"),
-    ]
+    ];
+    args.extend(normalize_codex_extra_args(extra_args));
+    args
 }
 
-pub fn build_codex_command(app_dir: &Path, debug_port: u16) -> Vec<String> {
+pub fn build_codex_command(app_dir: &Path, debug_port: u16, extra_args: &[String]) -> Vec<String> {
     let mut command = vec![
         crate::app_paths::build_codex_executable(app_dir)
             .to_string_lossy()
             .to_string(),
     ];
-    command.extend(build_codex_arguments(debug_port));
+    command.extend(build_codex_arguments(debug_port, extra_args));
     command
 }
 
-pub fn build_packaged_activation(app_dir: &Path, debug_port: u16) -> Option<CodexLaunch> {
+pub fn build_packaged_activation(
+    app_dir: &Path,
+    debug_port: u16,
+    extra_args: &[String],
+) -> Option<CodexLaunch> {
     Some(CodexLaunch::PackagedActivation {
         app_user_model_id: crate::app_paths::packaged_app_user_model_id(app_dir)?,
-        arguments: command_line_arguments(&build_codex_arguments(debug_port)),
+        arguments: command_line_arguments(&build_codex_arguments(debug_port, extra_args)),
         process_id: None,
     })
-}
-
-pub fn codex_process_environment() -> HashMap<String, String> {
-    let env = std::env::vars().collect::<HashMap<_, _>>();
-    codex_process_environment_from(&env, crate::proxy::detect_system_proxy)
-}
-
-pub fn codex_process_environment_from(
-    env: &HashMap<String, String>,
-    detect_system_proxy: impl FnOnce() -> Option<String>,
-) -> HashMap<String, String> {
-    let mut env = env.clone();
-    if crate::proxy::has_proxy_environment(&env) {
-        return env;
-    }
-    if let Some(proxy) = detect_system_proxy() {
-        env.entry("HTTP_PROXY".to_string())
-            .or_insert_with(|| proxy.clone());
-        env.entry("HTTPS_PROXY".to_string())
-            .or_insert_with(|| proxy.clone());
-        env.entry("ALL_PROXY".to_string()).or_insert(proxy);
-    }
-    env
 }
 
 async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
@@ -762,7 +1391,7 @@ pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> boo
 
 async fn bridge_health_ok(debug_port: u16) -> anyhow::Result<bool> {
     let targets = crate::cdp::list_targets(debug_port).await?;
-    let target = crate::cdp::pick_page_target(&targets)?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
     let websocket_url = target
         .web_socket_debugger_url
         .as_deref()
@@ -787,12 +1416,13 @@ fn runtime_evaluate_result_is_true(result: &Value) -> bool {
 
 async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
     let targets = crate::cdp::list_targets(debug_port).await?;
-    let target = crate::cdp::pick_page_target(&targets)?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
     let websocket_url = target
         .web_socket_debugger_url
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
-    let script = crate::assets::injection_script(helper_port);
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let script = crate::assets::injection_script_with_settings(helper_port, &settings);
     let ctx = crate::routes::BridgeContext::core(Arc::new(crate::routes::CoreRuntimeService::new(
         debug_port,
         StatusStore::default(),
@@ -811,7 +1441,11 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
     .await
 }
 
-pub fn build_macos_open_command(app_dir: &Path, debug_port: u16) -> Vec<String> {
+pub fn build_macos_open_command(
+    app_dir: &Path,
+    debug_port: u16,
+    extra_args: &[String],
+) -> Vec<String> {
     let mut command = vec![
         "open".to_string(),
         "-W".to_string(),
@@ -819,7 +1453,7 @@ pub fn build_macos_open_command(app_dir: &Path, debug_port: u16) -> Vec<String> 
         app_dir.to_string_lossy().to_string(),
         "--args".to_string(),
     ];
-    command.extend(build_codex_arguments(debug_port));
+    command.extend(build_codex_arguments(debug_port, extra_args));
     command
 }
 
@@ -897,45 +1531,115 @@ async fn is_macos_app_running(app_dir: &Path) -> bool {
             .eq_ignore_ascii_case("true")
 }
 
-pub fn with_temporary_proxy_environment<T>(
-    env: &HashMap<String, String>,
-    run: impl FnOnce() -> T,
-) -> T {
-    let previous = apply_proxy_environment(env);
-    let result = run();
-    restore_proxy_environment(previous);
-    result
+#[cfg_attr(not(windows), allow(dead_code))]
+fn post_launch_guard_artifacts_ready(
+    artifacts: &crate::computer_use_guard::GuardArtifacts,
+) -> bool {
+    artifacts.notify_exe.is_some()
+        && artifacts.marketplace_path.is_some()
+        && (!artifacts.runtime_exports_needed || artifacts.sky_package_json.is_some())
 }
 
-async fn activate_packaged_app_with_environment(
-    app_user_model_id: &str,
-    arguments: &str,
-    env: &HashMap<String, String>,
-) -> anyhow::Result<u32> {
-    let previous = apply_proxy_environment(env);
-    let result = activate_packaged_app(app_user_model_id, arguments).await;
-    restore_proxy_environment(previous);
-    result
+#[cfg_attr(not(windows), allow(dead_code))]
+fn should_stop_post_launch_computer_use_guard(
+    stable_unchanged_attempts: usize,
+    artifacts: &crate::computer_use_guard::GuardArtifacts,
+) -> bool {
+    stable_unchanged_attempts >= POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS
+        && post_launch_guard_artifacts_ready(artifacts)
 }
 
-fn apply_proxy_environment(
-    env: &HashMap<String, String>,
-) -> [(&'static str, Option<std::ffi::OsString>); 3] {
-    let keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
-    let previous = keys.map(|key| (key, std::env::var_os(key)));
-    for key in keys {
-        if let Some(value) = env.get(key) {
-            set_env_var(key, value);
+#[cfg(windows)]
+async fn run_post_launch_computer_use_guard(
+    home: PathBuf,
+    mut artifacts: Option<crate::computer_use_guard::GuardArtifacts>,
+    shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut previous_delay = 0_u64;
+    let mut stable_unchanged_attempts = 0_usize;
+    for (index, delay) in POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let wait_seconds = delay.saturating_sub(previous_delay);
+        previous_delay = delay;
+        if wait_seconds > 0 {
+            tokio::select! {
+                _ = &mut *shutdown_rx => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)) => {}
+            }
         }
-    }
-    previous
-}
-
-fn restore_proxy_environment(previous: [(&'static str, Option<std::ffi::OsString>); 3]) {
-    for (key, value) in previous {
-        match value {
-            Some(value) => set_env_var(key, value),
-            None => remove_env_var(key),
+        let attempt = index + 1;
+        let resolved_artifacts = match artifacts.take() {
+            Some(artifacts) => artifacts,
+            None => match crate::computer_use_guard::resolve_computer_use_guard_artifacts(&home) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    stable_unchanged_attempts = 0;
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "computer_use_guard.post_launch_failed",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "delay_seconds": delay,
+                            "phase": "resolve_artifacts",
+                            "message": error.to_string()
+                        }),
+                    );
+                    continue;
+                }
+            },
+        };
+        let artifacts_ready = post_launch_guard_artifacts_ready(&resolved_artifacts);
+        artifacts = artifacts_ready.then_some(resolved_artifacts.clone());
+        match crate::computer_use_guard::ensure_computer_use_config_with_artifacts(
+            &home,
+            &resolved_artifacts,
+        ) {
+            Ok(result) => {
+                if !result.changed && artifacts_ready {
+                    stable_unchanged_attempts += 1;
+                } else {
+                    stable_unchanged_attempts = 0;
+                }
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "computer_use_guard.post_launch_ok",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "delay_seconds": delay,
+                        "changed": result.changed,
+                        "stable_unchanged_attempts": stable_unchanged_attempts,
+                        "notify_exe": result
+                            .notify_exe
+                            .map(|path| path.to_string_lossy().to_string())
+                    }),
+                );
+                if should_stop_post_launch_computer_use_guard(
+                    stable_unchanged_attempts,
+                    &resolved_artifacts,
+                ) {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "computer_use_guard.post_launch_stable_stop",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "delay_seconds": delay,
+                            "stable_unchanged_attempts": stable_unchanged_attempts
+                        }),
+                    );
+                    return;
+                }
+            }
+            Err(error) => {
+                stable_unchanged_attempts = 0;
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "computer_use_guard.post_launch_failed",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "delay_seconds": delay,
+                        "message": error.to_string()
+                    }),
+                );
+            }
         }
     }
 }
@@ -1008,25 +1712,6 @@ async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> {
 #[cfg(not(windows))]
 async fn terminate_windows_process_id(process_id: u32) -> anyhow::Result<()> {
     anyhow::bail!("cannot terminate Windows process id {process_id} on this platform")
-}
-
-fn set_env_var<K, V>(key: K, value: V)
-where
-    K: AsRef<std::ffi::OsStr>,
-    V: AsRef<std::ffi::OsStr>,
-{
-    unsafe {
-        std::env::set_var(key, value);
-    }
-}
-
-fn remove_env_var<K>(key: K)
-where
-    K: AsRef<std::ffi::OsStr>,
-{
-    unsafe {
-        std::env::remove_var(key);
-    }
 }
 
 fn launch_status(
@@ -1144,5 +1829,58 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
             CoUninitialize();
         }
         result.map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_launch_guard_stops_after_stable_ready_artifacts() {
+        let artifacts = crate::computer_use_guard::GuardArtifacts {
+            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
+            marketplace_path: Some(PathBuf::from("openai-bundled")),
+            sky_package_json: None,
+            runtime_exports_needed: false,
+        };
+
+        assert!(!should_stop_post_launch_computer_use_guard(2, &artifacts));
+        assert!(should_stop_post_launch_computer_use_guard(3, &artifacts));
+    }
+
+    #[test]
+    fn post_launch_guard_keeps_retrying_until_artifacts_are_ready() {
+        let missing_notify = crate::computer_use_guard::GuardArtifacts {
+            notify_exe: None,
+            marketplace_path: Some(PathBuf::from("openai-bundled")),
+            sky_package_json: None,
+            runtime_exports_needed: false,
+        };
+        let missing_marketplace = crate::computer_use_guard::GuardArtifacts {
+            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
+            marketplace_path: None,
+            sky_package_json: None,
+            runtime_exports_needed: false,
+        };
+        let missing_runtime_package = crate::computer_use_guard::GuardArtifacts {
+            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
+            marketplace_path: Some(PathBuf::from("openai-bundled")),
+            sky_package_json: None,
+            runtime_exports_needed: true,
+        };
+
+        assert!(!should_stop_post_launch_computer_use_guard(
+            3,
+            &missing_notify
+        ));
+        assert!(!should_stop_post_launch_computer_use_guard(
+            3,
+            &missing_marketplace
+        ));
+        assert!(!should_stop_post_launch_computer_use_guard(
+            3,
+            &missing_runtime_package
+        ));
     }
 }

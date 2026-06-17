@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use anyhow::Context;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
+use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HWND, LPARAM, MAX_PATH};
 #[cfg(windows)]
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -22,8 +22,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegCreateKeyW, RegDeleteKeyW,
-    RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ, RegCloseKey,
+    RegCreateKeyW, RegDeleteKeyW, RegDeleteValueW, RegEnumValueW, RegOpenKeyExW, RegSetValueExW,
 };
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
@@ -36,6 +36,11 @@ use windows::Win32::UI::Shell::{
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWMINNOACTIVE;
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SW_RESTORE,
+    SetForegroundWindow, ShowWindow,
+};
 #[cfg(windows)]
 use windows::core::{Interface, PCWSTR, PWSTR};
 
@@ -201,6 +206,72 @@ pub fn delete_current_user_value(subkey: &str, name: &str) -> anyhow::Result<()>
 }
 
 #[cfg(windows)]
+pub fn read_current_user_string_values(
+    subkey: &str,
+) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let subkey = wide_null(subkey);
+    let mut key = HKEY::default();
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+    }
+    .is_err()
+    {
+        return Ok(Vec::new());
+    }
+    let _guard = RegistryKeyGuard(key);
+    let mut values = Vec::new();
+    for index in 0.. {
+        let mut name = vec![0u16; 256];
+        let mut name_len = name.len() as u32;
+        let mut value_type = 0u32;
+        let mut data = vec![0u8; 8192];
+        let mut data_len = data.len() as u32;
+        let result = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                PWSTR(name.as_mut_ptr()),
+                &mut name_len,
+                None,
+                Some(&mut value_type),
+                Some(data.as_mut_ptr()),
+                Some(&mut data_len),
+            )
+        };
+        if result.is_err() {
+            break;
+        }
+        let name = OsString::from_wide(&name[..name_len as usize])
+            .to_string_lossy()
+            .to_string();
+        let value = if value_type == REG_SZ.0 || value_type == REG_EXPAND_SZ.0 {
+            let units = unsafe {
+                std::slice::from_raw_parts(
+                    data.as_ptr().cast::<u16>(),
+                    (data_len as usize).div_ceil(2),
+                )
+            };
+            let len = units.iter().position(|ch| *ch == 0).unwrap_or(units.len());
+            Some(
+                OsString::from_wide(&units[..len])
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        values.push((name, value));
+    }
+    Ok(values)
+}
+
+#[cfg(windows)]
 pub fn delete_current_user_key(subkey: &str) -> anyhow::Result<()> {
     let subkey = wide_null(subkey);
     unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr())) }
@@ -259,6 +330,29 @@ pub fn terminate_process(process_id: u32) -> bool {
 }
 
 #[cfg(windows)]
+pub fn activate_process_window(process_id: u32) -> bool {
+    let mut state = ActivateWindowState {
+        process_id,
+        hwnd: HWND::default(),
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_process_window_proc),
+            LPARAM((&mut state as *mut ActivateWindowState) as isize),
+        );
+    }
+    if state.hwnd.is_invalid() {
+        return false;
+    }
+    unsafe {
+        if IsIconic(state.hwnd).as_bool() {
+            let _ = ShowWindow(state.hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(state.hwnd).as_bool()
+    }
+}
+
+#[cfg(windows)]
 fn query_process_image_path(process_id: u32) -> Option<PathBuf> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()? };
     if handle.is_invalid() {
@@ -277,6 +371,29 @@ fn query_process_image_path(process_id: u32) -> Option<PathBuf> {
         .ok()?;
     }
     Some(PathBuf::from(OsString::from_wide(&buffer[..len as usize])))
+}
+
+#[cfg(windows)]
+struct ActivateWindowState {
+    process_id: u32,
+    hwnd: HWND,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn find_process_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut ActivateWindowState) };
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return BOOL(1);
+    }
+    let mut window_process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut window_process_id));
+    }
+    if window_process_id == state.process_id {
+        state.hwnd = hwnd;
+        return BOOL(0);
+    }
+    BOOL(1)
 }
 
 #[cfg(windows)]

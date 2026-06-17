@@ -1,12 +1,20 @@
 use codex_plus_core::watcher::{
     build_spawn_launcher_command, build_watcher_install_plan, cdp_listening, codex_process_ids,
     disable_watcher_at, enable_watcher_at, filter_killable_launcher_processes,
-    watcher_disabled_flag,
+    process_ids_still_running, should_recover_stale_launcher, watcher_disabled_flag,
 };
 
 #[test]
 fn cdp_listening_returns_true_for_bound_loopback_port() {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    assert!(cdp_listening(port));
+}
+
+#[test]
+fn cdp_listening_returns_true_for_bound_ipv6_loopback_port() {
+    let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     assert!(cdp_listening(port));
@@ -86,4 +94,20 @@ fn launcher_process_filter_protects_current_process_ancestry() {
     ];
 
     assert_eq!(filter_killable_launcher_processes(processes, 30), vec![40]);
+}
+
+#[test]
+fn stale_launcher_recovery_only_runs_when_codex_and_cdp_are_absent() {
+    assert!(should_recover_stale_launcher(false, false));
+    assert!(!should_recover_stale_launcher(true, false));
+    assert!(!should_recover_stale_launcher(false, true));
+    assert!(!should_recover_stale_launcher(true, true));
+}
+
+#[test]
+fn stop_wait_tracks_only_expected_process_ids() {
+    assert_eq!(
+        process_ids_still_running(&[10, 20, 30], [5, 20, 40, 30]),
+        vec![20, 30]
+    );
 }
