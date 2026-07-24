@@ -32,6 +32,10 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm install --package-lock=false
 
+      - name: Frontend tests
+        working-directory: apps/codex-plus-manager
+        run: npm test
+
       - name: TypeScript check
         working-directory: apps/codex-plus-manager
         run: npm run check
@@ -134,6 +138,8 @@ jobs:
       - name: Verify macOS bundle structure
         run: |
           set -euo pipefail
+          test -L "dist/macos/stage/Applications"
+          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
           for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"

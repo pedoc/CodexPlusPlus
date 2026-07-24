@@ -128,9 +128,21 @@ jobs:
           VERSION="${VERSION#V}"
           BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
 
+      - name: Build macOS zip asset
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION#V}"
+          mkdir -p dist/macos/app-${{ matrix.arch }}
+          cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
+          cp "target/${{ matrix.target }}/release/codex-plus-plus-manager" "dist/macos/app-${{ matrix.arch }}/"
+          (cd dist/macos && zip -r "CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.zip" "app-${{ matrix.arch }}")
+
       - name: Verify macOS bundle structure
         run: |
           set -euo pipefail
+          test -L "dist/macos/stage/Applications"
+          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
           for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
@@ -144,4 +156,51 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name }}
-          files: dist/macos/*.dmg
+          files: |
+            dist/macos/*.dmg
+            dist/macos/*.zip
+
+  latest-json:
+    name: Upload static latest.json
+    runs-on: ubuntu-latest
+    needs:
+      - windows-installer
+      - macos-dmg
+    steps:
+      - name: Generate latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$REPO" --json assets,body,tagName,url > release.json
+          node <<'NODE'
+          const fs = require("fs");
+          const release = JSON.parse(fs.readFileSync("release.json", "utf8"));
+          const repo = process.env.REPO;
+          const tag = release.tagName || process.env.TAG;
+          const version = tag.replace(/^v/i, "");
+          const baseUrl = `https://github.com/${repo}/releases/download/${tag}`;
+          const assets = (release.assets || [])
+            .map((asset) => asset.name)
+            .filter((name) => name !== "latest.json")
+            .map((name) => ({ name, url: `${baseUrl}/${encodeURIComponent(name)}` }));
+          const payload = {
+            version: `v${version}`,
+            url: release.url || `https://github.com/${repo}/releases/tag/${tag}`,
+            body: release.body || "",
+            assets
+          };
+          fs.writeFileSync("latest.json", `${JSON.stringify(payload, null, 2)}\n`);
+          NODE
+          cat latest.json
+
+      - name: Upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"

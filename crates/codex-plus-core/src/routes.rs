@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -77,7 +77,6 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn open_devtools(&self) -> anyhow::Result<Value>;
     async fn open_manager(&self) -> anyhow::Result<Value>;
     async fn backend_status(&self) -> anyhow::Result<Value>;
-    async fn repair_backend(&self) -> anyhow::Result<Value>;
     async fn codex_model_catalog(&self) -> anyhow::Result<Value>;
     async fn ads(&self) -> anyhow::Result<Value>;
     async fn zed_remote_status(&self) -> anyhow::Result<Value>;
@@ -165,7 +164,6 @@ pub async fn handle_bridge_request(
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager().await,
         "/backend/status" => ctx.runtime.backend_status().await,
-        "/backend/repair" => ctx.runtime.repair_backend().await,
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),
         "/ads" => ctx.runtime.ads().await,
@@ -196,6 +194,13 @@ pub async fn handle_bridge_request(
             ctx.runtime.upstream_worktree_prepare(payload.clone()).await
         }
         "/upstream-worktree/create" => ctx.runtime.upstream_worktree_create(payload.clone()).await,
+        "/stepwise/settings" => stepwise_settings_value(ctx.settings.get_settings().await),
+        "/stepwise/generate" => {
+            stepwise_generate_value(ctx.settings.get_settings().await, payload.clone()).await
+        }
+        "/stepwise/test" => {
+            stepwise_test_value(ctx.settings.get_settings().await, payload.clone()).await
+        }
         "/delete" => result_value(ctx.data.delete(session_from_payload(&payload)).await),
         "/undo" => {
             let undo_token = payload
@@ -435,14 +440,13 @@ impl BridgeRuntimeService for CoreRuntimeService {
     }
 
     async fn open_manager(&self) -> anyhow::Result<Value> {
-        let manager_path = manager_exe_path();
-        if !manager_path.exists() {
-            anyhow::bail!("未找到管理工具：{}", manager_path.display());
-        }
-        spawn_manager(&manager_path)?;
+        let target = crate::install::spawn_companion(
+            crate::install::MANAGER_BINARY,
+            std::iter::empty::<&str>(),
+        )?;
         Ok(json!({
             "status": "ok",
-            "path": manager_path.to_string_lossy()
+            "path": target
         }))
     }
 
@@ -456,10 +460,6 @@ impl BridgeRuntimeService for CoreRuntimeService {
             }),
         );
         Ok(json!({"status": "ok", "message": "后端已连接", "version": crate::version::VERSION}))
-    }
-
-    async fn repair_backend(&self) -> anyhow::Result<Value> {
-        self.backend_status().await
     }
 
     async fn codex_model_catalog(&self) -> anyhow::Result<Value> {
@@ -600,29 +600,13 @@ impl BridgeDataService for UnavailableDataService {
     }
 }
 
-fn manager_exe_path() -> PathBuf {
-    crate::install::option_or_current_exe(&None, crate::install::MANAGER_BINARY)
-}
-
-fn spawn_manager(manager_path: &Path) -> anyhow::Result<()> {
-    let mut command = std::process::Command::new(manager_path);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(crate::windows_create_no_window());
-    }
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
-}
-
 fn settings_payload_value(
     settings: BackendSettings,
     codex_app_version: String,
 ) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(settings)?;
     if let Some(object) = value.as_object_mut() {
+        object.remove("codexAppStepwiseApiKey");
         object.insert(
             "codexAppVersion".to_string(),
             Value::String(codex_app_version),
@@ -645,6 +629,33 @@ where
     T: serde::Serialize,
 {
     Ok(serde_json::to_value(result?)?)
+}
+
+fn stepwise_settings_value(result: anyhow::Result<BackendSettings>) -> anyhow::Result<Value> {
+    let settings = result?;
+    Ok(json!({
+        "status": "ok",
+        "settings": crate::stepwise::public_settings(&settings),
+    }))
+}
+
+async fn stepwise_generate_value(
+    result: anyhow::Result<BackendSettings>,
+    payload: Value,
+) -> anyhow::Result<Value> {
+    let settings = result?;
+    let request = payload.get("request").cloned().unwrap_or(payload);
+    let request =
+        serde_json::from_value::<crate::stepwise::StepwiseRequest>(request).unwrap_or_default();
+    crate::stepwise::generate(request, &settings).await
+}
+
+async fn stepwise_test_value(
+    result: anyhow::Result<BackendSettings>,
+    payload: Value,
+) -> anyhow::Result<Value> {
+    let settings = crate::stepwise::settings_with_payload(result?, &payload);
+    crate::stepwise::test_connection(&settings).await
 }
 
 fn diagnostic_log_value(payload: Value) -> anyhow::Result<Value> {
