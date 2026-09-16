@@ -327,8 +327,8 @@ fn register_imported_thread(
     add!("model_provider", model_provider.to_string());
     add!("cwd", cwd);
     add!("title", title.to_string());
-    add!("sandbox_policy", r#"{"type":"disabled"}"#.to_string());
-    add!("approval_mode", "never".to_string());
+    add!("sandbox_policy", r#"{"type":"read-only"}"#.to_string());
+    add!("approval_mode", "on-request".to_string());
     add!("tokens_used", 0_i64);
     add!("has_user_event", 1_i64);
     add!("archived", 0_i64);
@@ -522,5 +522,47 @@ mod tests {
         assert!(rewritten.contains("\"cwd\":\"/safe/home\""));
         assert!(rewritten.contains("\"approval_mode\":\"on-request\""));
         assert!(rewritten.contains("\"type\":\"read-only\""));
+    }
+
+    #[test]
+    fn imported_thread_uses_safe_database_policy_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let sqlite_dir = home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        let db_path = sqlite_dir.join("state_5.sqlite");
+        let db = Connection::open(&db_path).unwrap();
+        db.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT)",
+            [],
+        )
+        .unwrap();
+
+        register_imported_thread(
+            home,
+            "imported",
+            &home.join("sessions/imported.jsonl"),
+            "Imported",
+            r#"{"type":"session_meta","payload":{"cwd":"/attacker"}}"#,
+            1,
+        )
+        .unwrap();
+
+        let row = db
+            .query_row(
+                "SELECT cwd, sandbox_policy, approval_mode FROM threads WHERE id = 'imported'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, home.to_string_lossy());
+        assert_eq!(row.1, r#"{"type":"read-only"}"#);
+        assert_eq!(row.2, "on-request");
     }
 }

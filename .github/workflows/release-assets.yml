@@ -58,14 +58,22 @@ jobs:
       - name: Build Windows zip asset
         shell: pwsh
         run: |
-          $version = "${{ env.RELEASE_TAG }}".TrimStart("v", "V")
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Invalid release tag: $tag"
+          }
+          $version = $tag.TrimStart("v", "V")
           New-Item -ItemType Directory -Force dist/windows | Out-Null
           Compress-Archive -Path dist/windows/app/* -DestinationPath "dist/windows/CodexPlusPlus-$version-windows-x64.zip" -Force
 
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $version = "${{ env.RELEASE_TAG }}".TrimStart("v", "V")
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
+            throw "Invalid release tag: $tag"
+          }
+          $version = $tag.TrimStart("v", "V")
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) {
             $makensis = "makensis"
