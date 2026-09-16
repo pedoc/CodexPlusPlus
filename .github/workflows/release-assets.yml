@@ -31,25 +31,25 @@ jobs:
           }
 
       - name: Checkout release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
 
       - name: Install NSIS
         run: choco install nsis -y
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
+        run: npm ci
 
       - name: Build frontend
         working-directory: apps/codex-plus-manager
@@ -93,7 +93,7 @@ jobs:
           Pop-Location
 
       - name: Upload Windows installer
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: |
@@ -125,24 +125,24 @@ jobs:
           fi
 
       - name: Checkout release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           targets: ${{ matrix.target }}
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
+        run: npm ci
 
       - name: Build frontend
         working-directory: apps/codex-plus-manager
@@ -182,7 +182,7 @@ jobs:
           done
 
       - name: Upload macOS DMG
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: |

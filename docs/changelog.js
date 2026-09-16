@@ -1,4 +1,4 @@
-const changelogRepository = "BigPizzaV3/CodexPlusPlus";
+const changelogRepository = "pedoc/CodexPlusPlus";
 
 const escapeHtml = (value) => String(value || "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;",

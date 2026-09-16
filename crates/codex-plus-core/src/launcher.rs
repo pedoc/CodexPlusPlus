@@ -612,11 +612,21 @@ impl DefaultLaunchHooks {
 }
 
 fn helper_bind_host() -> String {
-    std::env::var("CODEX_PLUS_HELPER_BIND")
+    let requested = std::env::var("CODEX_PLUS_HELPER_BIND")
         .ok()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+        .filter(|value| !value.is_empty());
+    match requested.as_deref() {
+        Some("localhost") => "127.0.0.1".to_string(),
+        Some(value)
+            if value
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback()) =>
+        {
+            value.to_string()
+        }
+        _ => "127.0.0.1".to_string(),
+    }
 }
 
 #[async_trait(?Send)]

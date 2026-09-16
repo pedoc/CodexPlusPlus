@@ -1,5 +1,5 @@
-const repository = "BigPizzaV3/CodexPlusPlus";
-const fallbackVersion = "1.2.46";
+const repository = "pedoc/CodexPlusPlus";
+const fallbackVersion = "1.3.1";
 
 const translations = {
   "跳到主要内容": "Skip to main content",

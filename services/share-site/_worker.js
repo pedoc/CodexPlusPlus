@@ -1,6 +1,8 @@
 const MAX_BODY_BYTES = 23_000_000;
 const MAX_CIPHERTEXT_LENGTH = 22_500_000;
 const ALLOWED_TTLS = new Set([86_400, 604_800, 2_592_000]);
+const RATE_LIMIT_WINDOW_SECONDS = 60;
+const MAX_CREATES_PER_WINDOW = 30;
 
 export default {
   async fetch(request, env) {
@@ -44,6 +46,10 @@ export default {
 async function createShare(request, env) {
   if (!isJsonRequest(request)) {
     return json({ error: "Content-Type must be application/json" }, 415);
+  }
+
+  if (await isCreateRateLimited(request, env)) {
+    return json({ error: "Too many share creations" }, 429, { "Retry-After": "60" });
   }
 
   const contentLength = Number(request.headers.get("content-length") || 0);
@@ -149,6 +155,18 @@ async function deleteShare(request, id, env) {
 
   await env.SHARES.delete(`share:${id}`);
   return new Response(null, { status: 204, headers: corsHeaders() });
+}
+
+async function isCreateRateLimited(request, env) {
+  const clientId = request.headers.get("CF-Connecting-IP") || "unknown";
+  const window = Math.floor(Date.now() / (RATE_LIMIT_WINDOW_SECONDS * 1000));
+  const key = `rate:${window}:${await sha256(clientId)}`;
+  const current = Number(await env.SHARES.get(key) || 0);
+  if (current >= MAX_CREATES_PER_WINDOW) return true;
+  await env.SHARES.put(key, String(current + 1), {
+    expirationTtl: RATE_LIMIT_WINDOW_SECONDS * 2,
+  });
+  return false;
 }
 
 function isJsonRequest(request) {
