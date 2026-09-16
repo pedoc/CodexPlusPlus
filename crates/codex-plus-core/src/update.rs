@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
+pub const DEFAULT_REPOSITORY: &str = "pedoc/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
-    "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
+    "https://github.com/pedoc/CodexPlusPlus/releases/latest/download/latest.json";
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
-const TRUSTED_RELEASE_OWNER: &str = "BigPizzaV3";
+const TRUSTED_RELEASE_OWNER: &str = "pedoc";
 const TRUSTED_RELEASE_REPOSITORY: &str = "CodexPlusPlus";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
