@@ -53,7 +53,11 @@ async function createShare(request, env) {
 
   let body;
   try {
-    body = await request.json();
+    const rawBody = await request.arrayBuffer();
+    if (rawBody.byteLength > MAX_BODY_BYTES) {
+      return json({ error: "Share is too large" }, 413);
+    }
+    body = JSON.parse(new TextDecoder().decode(rawBody));
   } catch {
     return json({ error: "Invalid JSON" }, 400);
   }

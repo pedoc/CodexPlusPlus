@@ -110,6 +110,12 @@ pub async fn run_weixin_connect(
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
+    if config.allow_from.is_empty() {
+        bail!("请先配置微信允许的联系人 ID，不能留空");
+    }
+    if config.sandbox == "danger-full-access" {
+        bail!("微信远程连接不允许使用 danger-full-access 沙箱");
+    }
     let work_dir = if config.work_dir.is_empty() {
         std::env::current_dir().context("无法读取当前工作目录")?
     } else {
@@ -359,12 +365,12 @@ fn compact_work_dir(work_dir: &std::path::Path) -> String {
 
 fn is_allowed_peer(allow_from: &str, peer: &str) -> bool {
     let allow_from = allow_from.trim();
-    allow_from.is_empty()
-        || allow_from == "*"
-        || allow_from
-            .split(',')
-            .map(str::trim)
-            .any(|allowed| !allowed.is_empty() && allowed == peer)
+    !allow_from.is_empty()
+        && (allow_from == "*"
+            || allow_from
+                .split(',')
+                .map(str::trim)
+                .any(|allowed| !allowed.is_empty() && allowed == peer))
 }
 
 fn normalize_sandbox(value: &str) -> String {
@@ -405,8 +411,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allow_from_supports_wildcard_and_comma_separated_ids() {
-        assert!(is_allowed_peer("", "a@im.wechat"));
+    fn allow_from_requires_an_explicit_peer_or_wildcard() {
+        assert!(!is_allowed_peer("", "a@im.wechat"));
         assert!(is_allowed_peer("*", "a@im.wechat"));
         assert!(is_allowed_peer("a@im.wechat, b@im.wechat", "b@im.wechat"));
         assert!(!is_allowed_peer("a@im.wechat", "b@im.wechat"));
@@ -422,6 +428,13 @@ mod tests {
         .normalized();
         assert_eq!(config.base_url, "https://example.test");
         assert_eq!(config.sandbox, "read-only");
+
+        let dangerous = WeixinConnectConfig {
+            sandbox: "danger-full-access".to_string(),
+            ..WeixinConnectConfig::default()
+        }
+        .normalized();
+        assert_eq!(dangerous.sandbox, "danger-full-access");
     }
 
     #[test]

@@ -131,7 +131,7 @@ jobs:
       - name: Build macOS zip asset
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           VERSION="${VERSION#V}"
           mkdir -p dist/macos/app-${{ matrix.arch }}
           cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
@@ -155,7 +155,7 @@ jobs:
       - name: Upload macOS DMG
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/macos/*.dmg
             dist/macos/*.zip
@@ -171,7 +171,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.RELEASE_TAG }}
         shell: bash
         run: |
           set -euo pipefail
@@ -186,7 +186,20 @@ jobs:
           const assets = (release.assets || [])
             .map((asset) => asset.name)
             .filter((name) => name !== "latest.json")
-            .map((name) => ({ name, url: `${baseUrl}/${encodeURIComponent(name)}` }));
+            .map((name) => {
+              const asset = (release.assets || []).find((candidate) => candidate.name === name);
+              const digest = typeof asset?.digest === "string"
+                ? asset.digest.replace(/^sha256:/i, "")
+                : "";
+              if (!/^[0-9a-f]{64}$/i.test(digest)) {
+                throw new Error(`Missing SHA-256 digest for ${name}`);
+              }
+              return {
+                name,
+                url: `${baseUrl}/${encodeURIComponent(name)}`,
+                sha256: digest
+              };
+            });
           const payload = {
             version: `v${version}`,
             url: release.url || `https://github.com/${repo}/releases/tag/${tag}`,
@@ -200,7 +213,7 @@ jobs:
       - name: Upload latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ env.RELEASE_TAG }}
           REPO: ${{ github.repository }}
         shell: bash
         run: gh release upload "$TAG" latest.json --clobber --repo "$REPO"

@@ -564,7 +564,10 @@ impl SQLiteStorageAdapter {
             "assigned_thread_id = ?1",
             &[&thread_id],
         )?;
-        let file_backups = rollout_file_backups(tables.get("threads").and_then(Value::as_array));
+        let file_backups = rollout_file_backups(
+            tables.get("threads").and_then(Value::as_array),
+            self.codex_home.as_deref(),
+        );
         if !file_backups.is_empty() {
             tables.insert("__files".to_string(), Value::Array(file_backups.clone()));
         }
@@ -1302,11 +1305,25 @@ fn delete_related_rows(
     Ok(())
 }
 
-fn rollout_file_backups(thread_rows: Option<&Vec<Value>>) -> Vec<Value> {
+fn rollout_file_backups(
+    thread_rows: Option<&Vec<Value>>,
+    codex_home: Option<&Path>,
+) -> Vec<Value> {
     thread_rows
         .into_iter()
         .flatten()
         .filter_map(|row| row.get("rollout_path").and_then(Value::as_str))
+        .filter(|path| {
+            codex_home.is_none_or(|home| {
+                let Ok(home) = home.canonicalize() else {
+                    return false;
+                };
+                let Ok(path) = Path::new(path).canonicalize() else {
+                    return false;
+                };
+                path.starts_with(home)
+            })
+        })
         .filter_map(|path| {
             let bytes = fs::read(path).ok()?;
             Some(json!({

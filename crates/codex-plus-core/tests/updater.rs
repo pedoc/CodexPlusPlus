@@ -57,7 +57,7 @@ fn latest_json_payload_selects_platform_installer_without_github_api_shape() {
         "body": "静态更新描述",
         "assets": [
             {"name": "source.zip", "url": "https://example.test/source.zip"},
-            {"name": "CodexPlusPlus-1.1.6-windows-x64-setup.exe", "url": "https://example.test/setup.exe"},
+            {"name": "CodexPlusPlus-1.1.6-windows-x64-setup.exe", "url": "https://example.test/setup.exe", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
             {"name": "CodexPlusPlus-1.1.6-macos-x64.dmg", "url": "https://example.test/app.dmg"}
         ]
     }))
@@ -66,6 +66,10 @@ fn latest_json_payload_selects_platform_installer_without_github_api_shape() {
     assert_eq!(release.version, "v1.1.6");
     assert_eq!(release.body, "静态更新描述");
     if cfg!(windows) {
+        assert_eq!(
+            release.asset_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
         assert_eq!(
             release.asset_name.as_deref(),
             Some("CodexPlusPlus-1.1.6-windows-x64-setup.exe")
@@ -162,6 +166,7 @@ fn download_asset_to_writes_bytes() {
         body: "fixes".to_string(),
         asset_name: Some("pkg.zip".to_string()),
         asset_url: Some("https://example.test/pkg.zip".to_string()),
+        asset_sha256: None,
     };
 
     let path = download_asset_to(&release, b"abcdef", dir.path()).unwrap();

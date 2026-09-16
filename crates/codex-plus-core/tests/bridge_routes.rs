@@ -13,6 +13,11 @@ use codex_plus_core::settings::BackendSettings;
 use codex_plus_core::status::StatusStore;
 use codex_plus_core::user_scripts::UserScriptManager;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 #[tokio::test]
 async fn bridge_routes_cover_all_current_paths() {
@@ -810,7 +815,7 @@ async fn user_script_manager_deletes_market_script_metadata_and_rejects_builtin_
         tags: Vec::new(),
         homepage: "https://example.com/demo".to_string(),
         script_url: "https://example.com/demo.js".to_string(),
-        sha256: String::new(),
+        sha256: sha256_hex(b"window.demo = true;"),
     };
 
     codex_plus_core::script_market::install_market_script_content(
@@ -983,7 +988,7 @@ fn script_market_manifest_filters_invalid_entries() {
                 "tags": ["ui", 42],
                 "homepage": "https://example.com/demo",
                 "script_url": "https://example.com/demo.js",
-                "sha256": ""
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             },
             { "id": "", "name": "Bad", "version": "1", "script_url": "https://example.com/bad.js" },
             { "id": "missing-url", "name": "Bad", "version": "1" }
@@ -1021,7 +1026,7 @@ fn user_script_inventory_includes_market_metadata() {
             tags: vec!["ui".to_string()],
             homepage: "https://example.com/demo".to_string(),
             script_url: "https://example.com/demo.js".to_string(),
-            sha256: String::new(),
+            sha256: sha256_hex(b"window.demo = true;"),
         })
         .unwrap();
 
@@ -1058,7 +1063,7 @@ fn install_market_script_writes_file_and_records_metadata() {
         tags: Vec::new(),
         homepage: "https://example.com/demo".to_string(),
         script_url: "https://example.com/demo.js".to_string(),
-        sha256: String::new(),
+        sha256: sha256_hex(b"window.demo = true;"),
     };
 
     codex_plus_core::script_market::install_market_script_content(
@@ -1077,7 +1082,38 @@ fn install_market_script_writes_file_and_records_metadata() {
 }
 
 #[test]
-fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() {
+fn modified_market_script_is_blocked_from_the_enabled_bundle() {
+    let temp = tempfile::tempdir().unwrap();
+    let user_dir = temp.path().join("user");
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        user_dir.clone(),
+        temp.path().join("user_scripts.json"),
+    );
+    let content = b"window.demo = true;";
+    let script = codex_plus_core::script_market::MarketScript {
+        id: "demo".to_string(),
+        name: "Demo".to_string(),
+        description: String::new(),
+        version: "1.0.0".to_string(),
+        author: String::new(),
+        tags: Vec::new(),
+        homepage: String::new(),
+        script_url: "https://example.com/demo.js".to_string(),
+        sha256: sha256_hex(content),
+    };
+
+    codex_plus_core::script_market::install_market_script_content(&manager, &script, content)
+        .unwrap();
+    assert!(manager.build_enabled_bundle().unwrap().contains("window.demo"));
+
+    std::fs::write(user_dir.join("market-demo.js"), "window.tampered = true;").unwrap();
+    let bundle = manager.build_enabled_bundle().unwrap();
+    assert!(!bundle.contains("window.tampered"));
+}
+
+#[test]
+fn install_market_script_rejects_checksum_mismatch_and_preserves_existing_file() {
     let temp = tempfile::tempdir().unwrap();
     let user_dir = temp.path().join("user");
     std::fs::create_dir_all(&user_dir).unwrap();
@@ -1099,12 +1135,14 @@ fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() 
         sha256: "0000".to_string(),
     };
 
-    codex_plus_core::script_market::install_market_script_content(&manager, &script, b"new")
-        .unwrap();
+    let error =
+        codex_plus_core::script_market::install_market_script_content(&manager, &script, b"new")
+            .unwrap_err();
+    assert!(error.to_string().contains("checksum"));
 
     assert_eq!(
         std::fs::read_to_string(user_dir.join("market-demo.js")).unwrap(),
-        "new"
+        "old"
     );
 }
 

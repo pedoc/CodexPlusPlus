@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -69,6 +69,8 @@ pub struct MarketScriptInstall {
     pub version: String,
     pub script_url: String,
     pub homepage: String,
+    #[serde(default)]
+    pub sha256: String,
     pub installed_at: String,
 }
 
@@ -203,6 +205,7 @@ impl UserScriptManager {
                 version: script.version.clone(),
                 script_url: script.script_url.clone(),
                 homepage: script.homepage.clone(),
+                sha256: script.sha256.clone(),
                 installed_at: current_unix_timestamp_string(),
             },
         );
@@ -242,6 +245,11 @@ impl UserScriptManager {
             if !script.enabled {
                 continue;
             }
+            if let Some(market) = config.market.get(&script.key)
+                && !market_script_matches_checksum(&script.path, market)
+            {
+                continue;
+            }
             let source = fs::read_to_string(&script.path)
                 .unwrap_or_else(|error| format!("throw new Error({});", json!(error.to_string())));
             blocks.push(wrap_script(&script, &source));
@@ -262,19 +270,26 @@ impl UserScriptManager {
             .into_iter()
             .map(|script| {
                 let market = config.market.get(&script.key);
-                let fallback_status = if !config.enabled || !script.enabled {
+                let blocked = market.is_some_and(|item| {
+                    !market_script_matches_checksum(&script.path, item)
+                });
+                let fallback_status = if blocked {
+                    "blocked"
+                } else if !config.enabled || !script.enabled {
                     "disabled"
                 } else {
                     "not_loaded"
                 };
                 let live = runtime_scripts.and_then(|items| items.get(&script.key));
-                let status = if fallback_status == "disabled" {
+                let status = if blocked || fallback_status == "disabled" {
                     fallback_status
                 } else {
                     live.and_then(|item| item.get("status").and_then(Value::as_str))
                         .unwrap_or(fallback_status)
                 };
-                let error = if fallback_status == "disabled" {
+                let error = if blocked {
+                    "market script checksum verification failed"
+                } else if fallback_status == "disabled" {
                     ""
                 } else {
                     live.and_then(|item| item.get("error").and_then(Value::as_str))
@@ -358,6 +373,13 @@ struct UserScriptFile {
     enabled: bool,
 }
 
+fn market_script_matches_checksum(path: &Path, market: &MarketScriptInstall) -> bool {
+    let Ok(content) = fs::read(path) else {
+        return false;
+    };
+    crate::script_market::verify_script_sha256(&market.sha256, &content).is_ok()
+}
+
 fn wrap_script(script: &UserScriptFile, source: &str) -> String {
     format!(
         r#"
@@ -433,6 +455,7 @@ fn market_install_from_value(value: &Value) -> Option<MarketScriptInstall> {
         version: string_field(raw, "version")?,
         script_url: string_field(raw, "script_url")?,
         homepage: string_field(raw, "homepage").unwrap_or_default(),
+        sha256: string_field(raw, "sha256").unwrap_or_default(),
         installed_at: string_field(raw, "installed_at").unwrap_or_default(),
     })
 }

@@ -1171,7 +1171,11 @@ fn spawn_silent_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
 
 pub fn start_weixin_connect_from_saved_settings() {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    if settings.weixin_connect_enabled && !settings.weixin_connect_token.trim().is_empty() {
+    if settings.weixin_connect_enabled
+        && !settings.weixin_connect_token.trim().is_empty()
+        && !settings.weixin_connect_allow_from.trim().is_empty()
+        && settings.weixin_connect_sandbox != "danger-full-access"
+    {
         let _ = spawn_weixin_connect(settings);
     }
 }
@@ -1348,6 +1352,18 @@ pub fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::WeixinC
     if settings.weixin_connect_token.trim().is_empty() {
         return failed("请先扫码登录微信。", current_weixin_status());
     }
+    if settings.weixin_connect_allow_from.trim().is_empty() {
+        return failed(
+            "请先配置微信允许的联系人 ID；如确需放开全部联系人，请明确填写 *。",
+            current_weixin_status(),
+        );
+    }
+    if settings.weixin_connect_sandbox == "danger-full-access" {
+        return failed(
+            "微信远程连接不允许使用 danger-full-access 沙箱。",
+            current_weixin_status(),
+        );
+    }
     settings.weixin_connect_enabled = true;
     if let Err(error) = store.save(&settings) {
         return failed(
@@ -1445,6 +1461,12 @@ fn spawn_weixin_connect(
     .normalized();
     if config.token.is_empty() {
         anyhow::bail!("微信连接 token 为空");
+    }
+    if config.allow_from.is_empty() {
+        anyhow::bail!("微信连接 allow_from 不能为空");
+    }
+    if config.sandbox == "danger-full-access" {
+        anyhow::bail!("微信远程连接不允许使用 danger-full-access 沙箱");
     }
     let stop = Arc::new(AtomicBool::new(false));
     let mut runtime = weixin_runtime()
@@ -1557,6 +1579,15 @@ pub fn save_settings(settings: BackendSettings) -> CommandResult<SettingsPayload
                 user_scripts: user_script_inventory(),
             },
         );
+    }
+    if previous.weixin_connect_allow_from != settings.weixin_connect_allow_from
+        || previous.weixin_connect_sandbox != settings.weixin_connect_sandbox
+    {
+        if let Ok(runtime) = weixin_runtime().lock()
+            && let Some(runtime) = runtime.as_ref()
+        {
+            runtime.stop.store(true, Ordering::SeqCst);
+        }
     }
     match store.save(&settings) {
         Ok(()) => settings_payload("设置已保存。", "设置保存后重新读取失败"),
@@ -2744,13 +2775,10 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
         title: request.title,
     };
     let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    // The renderer may report which database contained a row, but it must not
+    // choose an arbitrary SQLite file to mutate. Re-discover the candidates
+    // from the configured Codex home instead.
     let mut candidate_paths = Vec::new();
-    if let Some(path) = request.db_path.as_deref() {
-        let path = PathBuf::from(path);
-        if !candidate_paths.iter().any(|candidate| candidate == &path) {
-            candidate_paths.push(path);
-        }
-    }
     for path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home) {
         if !candidate_paths.iter().any(|candidate| candidate == &path) {
             candidate_paths.push(path);
@@ -2761,7 +2789,6 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
         json!({
             "session_id": session_id,
             "title": session.title,
-            "requested_db_path": request.db_path,
             "candidate_paths": candidate_paths
                 .iter()
                 .map(|path| path.to_string_lossy().to_string())
@@ -4078,7 +4105,7 @@ pub async fn check_update() -> CommandResult<Value> {
 pub async fn perform_update(
     release: Option<codex_plus_core::update::Release>,
 ) -> CommandResult<Value> {
-    let Some(release) = release else {
+    let Some(requested_release) = release else {
         return failed(
             "请先检查更新并选择可下载的 Release asset。",
             json!({
@@ -4086,6 +4113,25 @@ pub async fn perform_update(
                 "progress": 0
             }),
         );
+    };
+    // Never trust the renderer's Release object as update authority. Re-fetch
+    // the trusted, checksummed release catalog before downloading anything.
+    let release = match codex_plus_core::update::fetch_latest_release(
+        codex_plus_core::update::DEFAULT_LATEST_JSON_URL,
+    )
+    .await
+    {
+        Ok(release) => release,
+        Err(error) => {
+            return failed(
+                &format!("重新验证更新失败：{error}"),
+                json!({
+                    "currentVersion": codex_plus_core::version::VERSION,
+                    "latestVersion": requested_release.version,
+                    "progress": 0
+                }),
+            );
+        }
     };
     let download_dir = codex_plus_core::paths::default_app_state_dir().join("updates");
     match codex_plus_core::update::perform_update(&release, &download_dir).await {
@@ -5968,6 +6014,58 @@ fn builtin_user_scripts_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("user_scripts"))
 }
 
+fn diagnostics_settings_payload(settings: &BackendSettings) -> Value {
+    json!({
+        "providerSyncEnabled": settings.provider_sync_enabled,
+        "relayProfilesEnabled": settings.relay_profiles_enabled,
+        "enhancementsEnabled": settings.enhancements_enabled,
+        "codexAppPluginMarketplaceUnlock": settings.codex_app_plugin_marketplace_unlock,
+        "codexAppModelWhitelistUnlock": settings.codex_app_model_whitelist_unlock,
+        "codexAppSessionDelete": settings.codex_app_session_delete,
+        "codexAppMarkdownExport": settings.codex_app_markdown_export,
+        "codexAppPasteFix": settings.codex_app_paste_fix,
+        "codexAppForceChineseLocale": settings.codex_app_force_chinese_locale,
+        "codexAppFastStartup": settings.codex_app_fast_startup,
+        "codexAppThreadIdBadge": settings.codex_app_thread_id_badge,
+        "codexAppConversationView": settings.codex_app_conversation_view,
+        "codexAppThreadScrollRestore": settings.codex_app_thread_scroll_restore,
+        "codexAppZedRemoteOpen": settings.codex_app_zed_remote_open,
+        "codexAppUpstreamWorktreeCreate": settings.codex_app_upstream_worktree_create,
+        "codexAppNativeMenuPlacement": settings.codex_app_native_menu_placement,
+        "codexAppNativeMenuLocalization": settings.codex_app_native_menu_localization,
+        "codexAppServiceTierControls": settings.codex_app_service_tier_controls,
+        "codexAppPetRealMouseLook": settings.codex_app_pet_real_mouse_look,
+        "codexAppStepwiseEnabled": settings.codex_app_stepwise_enabled,
+        "codexAppAnswerOutlineEnabled": settings.codex_app_answer_outline_enabled,
+        "codexAppImageOverlayEnabled": settings.codex_app_image_overlay_enabled,
+        "codexAppDreamSkinEnabled": settings.codex_app_dream_skin_enabled,
+        "codexGoalsEnabled": settings.codex_goals_enabled,
+        "weixinConnectEnabled": settings.weixin_connect_enabled,
+        "launchMode": settings.launch_mode,
+        "activeTool": settings.active_tool.as_str(),
+        "relayProfileCount": settings.relay_profiles.len(),
+        "aggregateRelayProfileCount": settings.aggregate_relay_profiles.len(),
+        "toolCount": settings.tools.len(),
+    })
+}
+
+fn diagnostics_overview_payload(overview: &OverviewPayload) -> Value {
+    json!({
+        "codexVersion": overview.codex_version,
+        "codexAppStatus": overview.codex_app.status,
+        "silentShortcutStatus": overview.silent_shortcut.status,
+        "managementShortcutStatus": overview.management_shortcut.status,
+        "latestLaunch": overview.latest_launch.as_ref().map(|launch| json!({
+            "status": launch.status,
+            "startedAtMs": launch.started_at_ms,
+            "debugPort": launch.debug_port,
+            "helperPort": launch.helper_port,
+        })),
+        "currentVersion": overview.current_version,
+        "updateStatus": overview.update_status,
+    })
+}
+
 fn diagnostics_report() -> String {
     let (codex_app_path, entrypoints, latest_launch) = load_overview_payload();
     let overview = ok(
@@ -5998,11 +6096,11 @@ fn diagnostics_report() -> String {
     serde_json::to_string_pretty(&json!({
         "generatedAtMs": generated_at_ms,
         "version": codex_plus_core::version::VERSION,
-        "overview": overview.payload,
-        "settings": settings,
+        "overview": diagnostics_overview_payload(&overview.payload),
+        "settings": diagnostics_settings_payload(&settings),
         "logs": {
-            "diagnosticLogPath": codex_plus_core::paths::default_diagnostic_log_path(),
-            "latestStatusPath": codex_plus_core::paths::default_latest_status_path()
+            "diagnosticLogPresent": codex_plus_core::paths::default_diagnostic_log_path().exists(),
+            "latestStatusPresent": codex_plus_core::paths::default_latest_status_path().exists()
         },
         "platform": {
             "os": std::env::consts::OS,
@@ -6290,6 +6388,33 @@ fn default_log_lines() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_settings_payload_omits_credentials_and_paths() {
+        let mut settings = BackendSettings::default();
+        settings.codex_app_path = "C:\\secret\\Codex.exe".to_string();
+        settings.relay_api_key = "relay-secret".to_string();
+        settings.codex_app_stepwise_api_key = "stepwise-secret".to_string();
+        settings.weixin_connect_token = "weixin-secret".to_string();
+        settings.relay_profiles[0].api_key = "profile-secret".to_string();
+        settings.relay_profiles[0].config_contents =
+            "experimental_bearer_token = \\\"config-secret\\\"".to_string();
+
+        let payload = diagnostics_settings_payload(&settings);
+        let serialized = serde_json::to_string(&payload).unwrap();
+
+        for secret in [
+            "C:\\\\secret\\\\Codex.exe",
+            "relay-secret",
+            "stepwise-secret",
+            "weixin-secret",
+            "profile-secret",
+            "config-secret",
+        ] {
+            assert!(!serialized.contains(secret), "diagnostics leaked {secret}");
+        }
+        assert_eq!(payload["relayProfileCount"], 1);
+    }
 
     /// 进程级全局状态的测试锁。
     ///

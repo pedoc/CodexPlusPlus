@@ -1,14 +1,20 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
     "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const TRUSTED_RELEASE_OWNER: &str = "BigPizzaV3";
+const TRUSTED_RELEASE_REPOSITORY: &str = "CodexPlusPlus";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseAsset {
@@ -23,6 +29,8 @@ pub struct Release {
     pub body: String,
     pub asset_name: Option<String>,
     pub asset_url: Option<String>,
+    #[serde(default)]
+    pub asset_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -89,6 +97,23 @@ pub fn release_from_github_payload(payload: &Value) -> anyhow::Result<Release> {
         })
         .collect::<Vec<_>>();
     let selected = select_update_asset(&assets);
+    let asset_sha256 = selected.as_ref().and_then(|asset| {
+        payload
+            .get("assets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|candidate| {
+                candidate.get("name").and_then(Value::as_str) == Some(asset.name.as_str())
+            })
+            .and_then(|candidate| {
+                candidate
+                    .get("digest")
+                    .or_else(|| candidate.get("sha256"))
+                    .and_then(Value::as_str)
+                    .and_then(normalize_sha256)
+            })
+    });
     Ok(Release {
         version,
         url: payload
@@ -103,6 +128,7 @@ pub fn release_from_github_payload(payload: &Value) -> anyhow::Result<Release> {
             .to_string(),
         asset_name: selected.as_ref().map(|asset| asset.name.clone()),
         asset_url: selected.map(|asset| asset.browser_download_url),
+        asset_sha256,
     })
 }
 
@@ -129,6 +155,23 @@ pub fn release_from_latest_json_payload(payload: &Value) -> anyhow::Result<Relea
         })
         .collect::<Vec<_>>();
     let selected = select_update_asset(&assets);
+    let asset_sha256 = selected.as_ref().and_then(|asset| {
+        payload
+            .get("assets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|candidate| {
+                candidate.get("name").and_then(Value::as_str) == Some(asset.name.as_str())
+            })
+            .and_then(|candidate| {
+                candidate
+                    .get("sha256")
+                    .or_else(|| candidate.get("digest"))
+                    .and_then(Value::as_str)
+                    .and_then(normalize_sha256)
+            })
+    });
     Ok(Release {
         version,
         url: payload
@@ -146,6 +189,7 @@ pub fn release_from_latest_json_payload(payload: &Value) -> anyhow::Result<Relea
             .to_string(),
         asset_name: selected.as_ref().map(|asset| asset.name.clone()),
         asset_url: selected.map(|asset| asset.browser_download_url),
+        asset_sha256,
     })
 }
 
@@ -167,6 +211,65 @@ pub fn select_update_asset(assets: &[(String, String)]) -> Option<ReleaseAsset> 
         name: name.to_string(),
         browser_download_url: url.to_string(),
     })
+}
+
+fn normalize_sha256(value: &str) -> Option<String> {
+    let value = value.trim().strip_prefix("sha256:").unwrap_or(value.trim());
+    (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| value.to_ascii_lowercase())
+}
+
+fn validate_release_asset(release: &Release) -> anyhow::Result<()> {
+    let name = release
+        .asset_name
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("没有可下载的 Release asset"))?;
+    if platform_asset_rank(&name.to_ascii_lowercase()) >= 2 {
+        anyhow::bail!("Release asset 不匹配当前平台：{name}");
+    }
+    let url = release
+        .asset_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("没有可下载的 Release asset URL"))?;
+    let parsed = reqwest::Url::parse(url).context("Release asset URL 格式无效")?;
+    let segments = parsed
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let expected_tag = release.version.trim();
+    let expected_path = [
+        TRUSTED_RELEASE_OWNER,
+        TRUSTED_RELEASE_REPOSITORY,
+        "releases",
+        "download",
+        expected_tag,
+        name,
+    ];
+    if parsed.scheme() != "https"
+        || parsed.host_str() != Some("github.com")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || segments != expected_path
+    {
+        anyhow::bail!("Release asset URL 不属于受信任的 Codex++ GitHub release");
+    }
+    if normalize_sha256(release.asset_sha256.as_deref().unwrap_or_default()).is_none() {
+        anyhow::bail!("Release asset 缺少有效的 SHA-256 校验值");
+    }
+    Ok(())
+}
+
+fn verify_release_checksum(release: &Release, bytes: &[u8]) -> anyhow::Result<()> {
+    let expected = release
+        .asset_sha256
+        .as_deref()
+        .and_then(normalize_sha256)
+        .ok_or_else(|| anyhow::anyhow!("Release asset 缺少有效的 SHA-256 校验值"))?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if actual != expected {
+        anyhow::bail!("Release asset SHA-256 校验失败");
+    }
+    Ok(())
 }
 
 pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Release> {
@@ -199,6 +302,7 @@ pub async fn perform_update(
     release: &Release,
     download_dir: &Path,
 ) -> anyhow::Result<UpdateInstall> {
+    validate_release_asset(release)?;
     let url = release
         .asset_url
         .as_ref()
@@ -232,16 +336,31 @@ pub async fn perform_update(
             return Err(anyhow::anyhow!("下载安装包失败：{error}"));
         }
     };
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "update.download.body_failed",
-                json!({ "version": release.version, "assetName": release.asset_name, "error": error.to_string() }),
-            );
-            return Err(anyhow::anyhow!("读取安装包失败：{error}"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_UPDATE_DOWNLOAD_BYTES)
+    {
+        anyhow::bail!("下载安装包超过大小限制");
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "update.download.body_failed",
+                    json!({ "version": release.version, "assetName": release.asset_name, "error": error.to_string() }),
+                );
+                return Err(anyhow::anyhow!("读取安装包失败：{error}"));
+            }
+        };
+        if bytes.len().saturating_add(chunk.len()) > MAX_UPDATE_DOWNLOAD_BYTES as usize {
+            anyhow::bail!("下载安装包超过大小限制");
         }
-    };
+        bytes.extend_from_slice(&chunk);
+    }
+    verify_release_checksum(release, &bytes)?;
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "update.download.completed",
         json!({

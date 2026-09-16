@@ -455,6 +455,25 @@ fn delete_codex_thread_removes_session_index_entry_and_undo_restores_it() {
 }
 
 #[test]
+fn delete_codex_thread_does_not_remove_rollout_outside_codex_home() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("codex-home");
+    let sqlite_dir = home.join("sqlite");
+    fs::create_dir_all(&sqlite_dir).unwrap();
+    let db_path = sqlite_dir.join("state_5.sqlite");
+    let outside_rollout = tmp.path().join("outside-rollout.jsonl");
+    fs::write(&outside_rollout, "{\"type\":\"message\"}\n").unwrap();
+    create_codex_thread_db(&db_path, &outside_rollout);
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")))
+        .with_codex_home(&home);
+
+    let deleted = adapter.delete_local(&session("local:t1", "Codex Thread"));
+
+    assert_eq!(deleted.status, DeleteStatus::LocalDeleted);
+    assert!(outside_rollout.exists());
+}
+
+#[test]
 fn delete_codex_thread_sqlite_dir_layout_removes_session_index_entry_and_undo_restores_it() {
     let tmp = tempdir().unwrap();
     let home = tmp.path();

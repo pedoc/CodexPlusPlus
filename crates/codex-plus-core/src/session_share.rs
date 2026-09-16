@@ -222,7 +222,7 @@ pub fn import_rollout(home: &Path, payload: &Value) -> anyhow::Result<Value> {
         bail!("会话文件超过导入大小限制");
     }
     let new_id = Uuid::new_v4().to_string();
-    let rewritten = rewrite_rollout(content, source_id, &new_id)?;
+    let rewritten = rewrite_rollout(content, source_id, &new_id, home)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -230,9 +230,9 @@ pub fn import_rollout(home: &Path, payload: &Value) -> anyhow::Result<Value> {
     let directory = home.join("sessions").join("imported");
     fs::create_dir_all(&directory).context("创建会话目录失败")?;
     let path = directory.join(format!("rollout-{now}-{new_id}.jsonl"));
-    fs::write(&path, rewritten).context("写入导入会话失败")?;
+    fs::write(&path, &rewritten).context("写入导入会话失败")?;
 
-    register_imported_thread(home, &new_id, &path, title, content, now)?;
+    register_imported_thread(home, &new_id, &path, title, &rewritten, now)?;
 
     let index_path = home.join("session_index.jsonl");
     let mut index = OpenOptions::new()
@@ -284,12 +284,7 @@ fn register_imported_thread(
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
     let metadata = session_metadata(content);
     let first_message = first_user_message(content).unwrap_or_else(|| title.to_string());
-    let cwd = metadata
-        .get("cwd")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| home.to_string_lossy().to_string());
+    let cwd = home.to_string_lossy().to_string();
     let model_provider = metadata
         .get("model_provider")
         .and_then(Value::as_str)
@@ -429,10 +424,16 @@ fn find_rollout_in(root: &Path, session_id: &str) -> Option<PathBuf> {
     None
 }
 
-fn rewrite_rollout(content: &str, old_id: &str, new_id: &str) -> anyhow::Result<String> {
+fn rewrite_rollout(
+    content: &str,
+    old_id: &str,
+    new_id: &str,
+    home: &Path,
+) -> anyhow::Result<String> {
     let mut lines = Vec::new();
     for line in content.lines() {
         let mut value: Value = serde_json::from_str(line).context("会话文件包含无效 JSON 行")?;
+        sanitize_imported_metadata(&mut value, home);
         replace_id(&mut value, old_id, new_id);
         lines.push(serde_json::to_string(&value)?);
     }
@@ -440,6 +441,28 @@ fn rewrite_rollout(content: &str, old_id: &str, new_id: &str) -> anyhow::Result<
         bail!("会话文件没有内容");
     }
     Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn sanitize_imported_metadata(value: &mut Value, home: &Path) {
+    let is_session_meta = value.get("type").and_then(Value::as_str) == Some("session_meta");
+    if !is_session_meta {
+        return;
+    }
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return;
+    };
+    payload.insert(
+        "cwd".to_string(),
+        Value::String(home.to_string_lossy().to_string()),
+    );
+    payload.insert(
+        "sandbox_policy".to_string(),
+        json!({ "type": "read-only" }),
+    );
+    payload.insert(
+        "approval_mode".to_string(),
+        Value::String("on-request".to_string()),
+    );
 }
 
 fn replace_id(value: &mut Value, old_id: &str, new_id: &str) {
@@ -493,8 +516,11 @@ mod tests {
     #[test]
     fn rewrites_ids_in_rollout_lines() {
         let content = r#"{"type":"session_meta","payload":{"id":"old","session_id":"old"}}"#;
-        let rewritten = rewrite_rollout(content, "old", "new").unwrap();
+        let rewritten = rewrite_rollout(content, "old", "new", Path::new("/safe/home")).unwrap();
         assert!(rewritten.contains("\"id\":\"new\""));
         assert!(rewritten.contains("\"session_id\":\"new\""));
+        assert!(rewritten.contains("\"cwd\":\"/safe/home\""));
+        assert!(rewritten.contains("\"approval_mode\":\"on-request\""));
+        assert!(rewritten.contains("\"type\":\"read-only\""));
     }
 }
