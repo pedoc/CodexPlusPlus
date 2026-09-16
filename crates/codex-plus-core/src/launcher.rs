@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -18,12 +19,19 @@ use tokio::sync::Mutex;
 use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
 use crate::status::{LaunchStatus, StatusStore};
 
-#[cfg(windows)]
-const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 180, 240, 300];
-#[cfg_attr(not(windows), allow(dead_code))]
-const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
+const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
+const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
+const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
+
+/// 协议代理的端口写死在 `config.toml` 的 `base_url = "http://127.0.0.1:57321/v1"` 里，
+/// 不能像普通 helper 端口那样临时换一个空闲的，否则 Codex CLI 会连到没人监听的地址。
+/// 而管理器的「重启」是先强杀旧 launcher 再拉新的，旧 helper 交还监听要一小会儿；
+/// 过去这里一次 bind 失败就整个启动中止，用户侧就是重启必失败、直接双击 exe 反而正常（issue #1933）。
+/// 所以固定端口下给前任一个让位的窗口，只对「端口被占用」重试。
+const HELPER_BIND_RETRY_TIMEOUT_MS: u64 = 6_000;
+const HELPER_BIND_RETRY_INTERVAL_MS: u64 = 200;
 
 /// Asynchronous callback used by the bridge watchdog to restore a launcher-specific bridge.
 ///
@@ -56,6 +64,13 @@ pub enum ProcessWaitStrategy {
 pub enum MacosCleanupPolicy {
     QuitIfNotPreviouslyRunning,
     SkipQuitBecauseAlreadyRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacosDebugLaunchAction {
+    LaunchNew,
+    ReuseRunningDebugApp,
+    RestartRunningApp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +137,10 @@ impl std::fmt::Debug for LaunchHandle {
 
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
-        let result = self.hooks.wait_for_codex_exit(&self.launch).await;
+        let result = self
+            .hooks
+            .wait_for_codex_exit(&self.launch, self.debug_port)
+            .await;
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
@@ -140,11 +158,24 @@ pub trait LaunchHooks: Send + Sync {
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
+    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
+    fn has_pending_remote_control_session_recoveries(&self) -> bool {
+        false
+    }
+    fn remote_control_session_recovery_is_safe_to_run(&self) -> bool {
+        true
+    }
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()>;
     async fn apply_active_relay_profile(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn ensure_computer_use_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        _settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
     async fn ensure_plugin_marketplace_config(
@@ -209,14 +240,12 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        _settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
     async fn write_status(&self, status: &str);
-    async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()>;
+    async fn wait_for_codex_exit(
+        &self,
+        launch: &CodexLaunch,
+        debug_port: u16,
+    ) -> anyhow::Result<()>;
     async fn shutdown_helper(&self, helper_port: u16);
     async fn terminate_codex(&self, launch: &CodexLaunch);
 }
@@ -227,8 +256,6 @@ pub struct DefaultLaunchHooks {
     helper: Mutex<Option<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
-    computer_use_guard_watchdog: Mutex<Option<ComputerUseGuardWatchdogRuntime>>,
-    computer_use_guard_artifacts: Mutex<Option<crate::computer_use_guard::GuardArtifacts>>,
 }
 
 struct HelperRuntime {
@@ -241,13 +268,63 @@ struct BridgeWatchdogRuntime {
     task: tokio::task::JoinHandle<()>,
 }
 
-struct ComputerUseGuardWatchdogRuntime {
-    shutdown: tokio::sync::oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
-}
-
 pub async fn launch_and_inject(options: LaunchOptions) -> anyhow::Result<LaunchHandle> {
     launch_and_inject_with_hooks(options, DefaultLaunchHooks::shared()).await
+}
+
+/// 判断错误链里是不是「端口已被占用」。只有这一种失败值得等前任让位重试，
+/// 其余（权限不足、地址非法等）重试多少次都一样，直接冒泡更快也更好排查。
+fn error_is_address_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// 端口被占用时按 `interval_ms` 重试启动 helper，直到成功或超过 `timeout_ms`。
+async fn start_helper_waiting_for_busy_port<F, Fut>(
+    mut start: F,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let mut waited_ms = 0;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let error = match start().await {
+            Ok(()) => {
+                if attempts > 1 {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "helper.bind_recovered_after_busy_port",
+                        serde_json::json!({
+                            "attempts": attempts,
+                            "waited_ms": waited_ms,
+                        }),
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        if !error_is_address_in_use(&error) || waited_ms >= timeout_ms {
+            return Err(error);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        waited_ms += interval_ms;
+    }
+}
+
+fn helper_bind_retry_timeout_ms(protocol_proxy_enabled: bool, is_macos: bool) -> u64 {
+    if protocol_proxy_enabled || is_macos {
+        HELPER_BIND_RETRY_TIMEOUT_MS
+    } else {
+        0
+    }
 }
 
 pub async fn launch_and_inject_with_hooks<H>(
@@ -269,12 +346,23 @@ where
 
     let result: anyhow::Result<LaunchHandle> = async {
         let home = crate::relay_config::default_codex_home_dir();
+        hooks.cleanup_unsupported_config()?;
         if settings.provider_sync_enabled {
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
                 &home,
                 "launcher.after_provider_sync",
+            );
+        }
+        if hooks.has_pending_remote_control_session_recoveries()
+            && hooks.remote_control_session_recovery_is_safe_to_run()
+        {
+            hooks.run_remote_control_session_recovery().await?;
+        } else if hooks.has_pending_remote_control_session_recoveries() {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.remote_control_session_finalization_deferred",
+                serde_json::json!({"reason": "desktop_writer_active"}),
             );
         }
         crate::dream_skin::sync_default_dream_skin_base_theme(
@@ -290,9 +378,6 @@ where
                     "message": error.to_string()
                 }),
             );
-        }
-        if settings.computer_use_guard_enabled {
-            hooks.ensure_computer_use_config(&settings).await?;
         }
         match crate::codex_sqlite::sanitize_historical_model_suffixes(&home) {
             Ok(result) if result.updated > 0 => {
@@ -314,12 +399,40 @@ where
                 );
             }
         }
-        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
+        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
+            || remote_control_provider_proxy_enabled(&settings);
         if protocol_proxy_enabled {
+            hooks.ensure_active_protocol_proxy_config(&settings).await?;
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            hooks.start_helper(helper_port).await?;
+            // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
+            let bind_retry_timeout_ms =
+                helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(target_os = "macos"));
+            start_helper_waiting_for_busy_port(
+                || hooks.start_helper(helper_port),
+                bind_retry_timeout_ms,
+                HELPER_BIND_RETRY_INTERVAL_MS,
+            )
+            .await
+            .map_err(|error| {
+                if protocol_proxy_enabled && error_is_address_in_use(&error) {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "helper.bind_gave_up_on_busy_port",
+                        serde_json::json!({
+                            "helper_port": helper_port,
+                            "waited_ms": bind_retry_timeout_ms,
+                        }),
+                    );
+                    return error.context(format!(
+                        "协议代理端口 {helper_port} 被其他进程占用，等待 {} 秒后仍未释放。\
+                         该端口写在 config.toml 的 base_url 里，不能自动改用其他端口；\
+                         请退出仍在运行的 Codex++ 或占用该端口的程序后重试。",
+                        bind_retry_timeout_ms / 1000
+                    ));
+                }
+                error
+            })?;
             helper_started = true;
         }
 
@@ -328,9 +441,6 @@ where
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
-        if settings.computer_use_guard_enabled {
-            hooks.start_computer_use_guard_watchdog(&settings).await?;
-        }
 
         let mut injection_degraded = false;
         if settings.enhancements_enabled {
@@ -406,6 +516,11 @@ where
 
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_uses_protocol_proxy()
+}
+
+fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
+    let profile = settings.active_relay_profile();
+    profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 
 fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
@@ -530,8 +645,24 @@ impl LaunchHooks for DefaultLaunchHooks {
         SettingsStore::default().load()
     }
 
+    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+        let home = crate::relay_config::default_codex_home_dir();
+        crate::relay_config::cleanup_unsupported_approval_policies_in_home(&home)?;
+        Ok(())
+    }
+
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
         anyhow::bail!("provider sync requires launcher hooks with codex-plus-data integration")
+    }
+
+    async fn run_remote_control_session_recovery(&self) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "Remote Control session recovery requires launcher hooks with codex-plus-data integration"
+        )
+    }
+
+    fn remote_control_session_recovery_is_safe_to_run(&self) -> bool {
+        crate::watcher::find_session_index_cleanup_blocking_processes().is_empty()
     }
 
     async fn apply_active_relay_profile(&self, settings: &BackendSettings) -> anyhow::Result<()> {
@@ -556,30 +687,23 @@ impl LaunchHooks for DefaultLaunchHooks {
         {
             let auth_contents = (!profile.auth_contents.trim().is_empty())
                 .then_some(profile.auth_contents.as_str());
-            crate::relay_config::clear_relay_config_to_home_with_auth_and_computer_use_guard(
-                &home,
-                auth_contents,
-                settings.computer_use_guard_enabled,
-            )?;
+            crate::relay_config::clear_relay_config_to_home_with_auth(&home, auth_contents)?;
             return Ok(());
         }
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules_and_computer_use_guard(
+        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
             &home,
             &profile,
             &common_config,
-            settings.computer_use_guard_enabled,
         )?;
         Ok(())
     }
 
-    async fn ensure_computer_use_config(&self, settings: &BackendSettings) -> anyhow::Result<()> {
-        if !settings.computer_use_guard_enabled {
-            return Ok(());
-        }
+    async fn ensure_active_protocol_proxy_config(
+        &self,
+        settings: &BackendSettings,
+    ) -> anyhow::Result<()> {
         let home = crate::relay_config::default_codex_home_dir();
-        let artifacts = crate::computer_use_guard::resolve_computer_use_guard_artifacts(&home)?;
-        crate::computer_use_guard::ensure_computer_use_config_with_artifacts(&home, &artifacts)?;
-        *self.computer_use_guard_artifacts.lock().await = Some(artifacts);
+        crate::relay_config::ensure_active_protocol_proxy_config_in_home(&home, settings)?;
         Ok(())
     }
 
@@ -587,10 +711,11 @@ impl LaunchHooks for DefaultLaunchHooks {
         &self,
         settings: &BackendSettings,
     ) -> anyhow::Result<()> {
+        let home = crate::relay_config::default_codex_home_dir();
+        crate::plugin_marketplace::cleanup_managed_reserved_marketplace_configs(&home)?;
         if !settings.codex_app_plugin_marketplace_unlock {
             return Ok(());
         }
-        let home = crate::relay_config::default_codex_home_dir();
         match crate::plugin_marketplace::ensure_openai_curated_marketplace_config(&home) {
             Ok(configured) => {
                 if configured {
@@ -680,13 +805,6 @@ impl LaunchHooks for DefaultLaunchHooks {
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
-        if settings.enhancements_enabled {
-            let home = crate::relay_config::default_codex_home_dir();
-            crate::codex_app_state::prepare_projectless_main_window_nonfatal(
-                &home,
-                "launcher.prelaunch",
-            );
-        }
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
@@ -732,10 +850,26 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
 
         if app_dir.extension().and_then(|value| value.to_str()) == Some("app") {
-            let cleanup_policy = if is_macos_app_running(app_dir).await {
-                MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
-            } else {
-                MacosCleanupPolicy::QuitIfNotPreviouslyRunning
+            let launch_action = select_macos_debug_launch_action(
+                is_macos_app_running(app_dir).await,
+                crate::cdp::endpoint_available(debug_port),
+            );
+            let cleanup_policy = match launch_action {
+                MacosDebugLaunchAction::LaunchNew => MacosCleanupPolicy::QuitIfNotPreviouslyRunning,
+                MacosDebugLaunchAction::ReuseRunningDebugApp => {
+                    MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
+                }
+                MacosDebugLaunchAction::RestartRunningApp => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.macos_existing_app_without_cdp_restart_requested",
+                        serde_json::json!({
+                            "app_dir": app_dir,
+                            "debug_port": debug_port
+                        }),
+                    );
+                    quit_macos_app_and_wait(app_dir).await?;
+                    MacosCleanupPolicy::QuitIfNotPreviouslyRunning
+                }
             };
             let command = if let Some(inspector_port) = native_menu_inspector_port {
                 build_macos_open_command_with_native_menu_inspector(
@@ -811,6 +945,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             #[cfg(windows)]
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
             let mut observed_browser_id: Option<String> = None;
+            let mut bridge_health_failures = 0u8;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
@@ -835,6 +970,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 helper_port,
                                 identity_changed,
                                 bridge_reinjector.clone(),
+                                &mut bridge_health_failures,
                             ),
                         );
                         record_pet_overlay_sync_result(debug_port, helper_port, pet_result);
@@ -859,61 +995,13 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn start_computer_use_guard_watchdog(
-        &self,
-        settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        #[cfg(windows)]
-        {
-            if !settings.computer_use_guard_enabled {
-                return Ok(());
-            }
-            let home = crate::relay_config::default_codex_home_dir();
-            let artifacts = self.computer_use_guard_artifacts.lock().await.clone();
-            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
-                run_post_launch_computer_use_guard(home, artifacts, &mut shutdown_rx).await;
-            });
-            if let Some(runtime) = self
-                .computer_use_guard_watchdog
-                .lock()
-                .await
-                .replace(ComputerUseGuardWatchdogRuntime { shutdown, task })
-            {
-                let _ = runtime.shutdown.send(());
-                let _ = runtime.task.await;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let _ = &settings;
-            let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
-                            crate::computer_use_guard::kill_orphaned_computer_use_processes();
-                        }
-                    }
-                }
-            });
-            if let Some(runtime) = self
-                .computer_use_guard_watchdog
-                .lock()
-                .await
-                .replace(ComputerUseGuardWatchdogRuntime { shutdown, task })
-            {
-                let _ = runtime.shutdown.send(());
-                let _ = runtime.task.await;
-            }
-        }
-        Ok(())
-    }
-
     async fn write_status(&self, _status: &str) {}
 
-    async fn wait_for_codex_exit(&self, launch: &CodexLaunch) -> anyhow::Result<()> {
+    async fn wait_for_codex_exit(
+        &self,
+        launch: &CodexLaunch,
+        debug_port: u16,
+    ) -> anyhow::Result<()> {
         match launch {
             CodexLaunch::Process { .. } => {
                 if let Some(mut child) = self.child.lock().await.take() {
@@ -936,7 +1024,10 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
         let mut empty_streak = 0u32;
         loop {
-            if crate::watcher::find_codex_processes().is_empty() {
+            let has_codex_process = !crate::watcher::find_codex_processes().is_empty();
+            let cdp_available = should_probe_launcher_cdp(cfg!(windows), has_codex_process)
+                && crate::cdp::endpoint_available(debug_port);
+            if !launcher_target_alive(has_codex_process, cdp_available) {
                 empty_streak = empty_streak.saturating_add(1);
                 if empty_streak >= 3 {
                     break;
@@ -950,10 +1041,6 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn shutdown_helper(&self, _helper_port: u16) {
-        if let Some(runtime) = self.computer_use_guard_watchdog.lock().await.take() {
-            let _ = runtime.shutdown.send(());
-            let _ = runtime.task.await;
-        }
         if let Some(runtime) = self.bridge_watchdog.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
@@ -1029,6 +1116,7 @@ async fn handle_helper_connection(
     let path = raw_path.split('?').next().unwrap_or(raw_path);
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
+    let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1054,8 +1142,86 @@ async fn handle_helper_connection(
         )
         .await;
     }
-    let request_body = String::from_utf8_lossy(&request.body);
+    if (crate::protocol_proxy::is_image_generations_proxy_path(path)
+        || crate::protocol_proxy::is_image_edits_proxy_path(path))
+        && method == "OPTIONS"
+    {
+        write_http_response(
+            &mut stream,
+            "204 No Content",
+            "application/json; charset=utf-8",
+            &[],
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    if (crate::protocol_proxy::is_image_generations_proxy_path(path)
+        || crate::protocol_proxy::is_image_edits_proxy_path(path))
+        && method == "POST"
+    {
+        return handle_image_proxy_connection(
+            &mut stream,
+            &request.body,
+            request_content_type.as_deref(),
+            request_user_agent.as_deref(),
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
+    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "GET" {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "upgrade_required",
+            "message": "WebSocket transport is not supported by the local protocol proxy; retry with HTTP."
+        }))?;
+        write_http_response(
+            &mut stream,
+            "426 Upgrade Required",
+            "application/json; charset=utf-8",
+            &body,
+        )
+        .await?;
+        log_helper_response(
+            "helper.responses_websocket_upgrade_required",
+            method,
+            path,
+            "426 Upgrade Required",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
     if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
+        let request_body = match decode_protocol_proxy_request_body(
+            &request.body,
+            request_content_encoding.as_deref(),
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "status": "failed",
+                    "message": error.to_string()
+                }))?;
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    &body,
+                )
+                .await?;
+                log_helper_response(
+                    "helper.protocol_proxy_decode_failed",
+                    method,
+                    path,
+                    "400 Bad Request",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        };
         return handle_protocol_proxy_connection(
             &mut stream,
             &request_body,
@@ -1066,6 +1232,7 @@ async fn handle_helper_connection(
         )
         .await;
     }
+    let request_body = String::from_utf8_lossy(&request.body);
     if crate::protocol_proxy::is_chat_completions_proxy_path(path) && method == "POST" {
         return handle_chat_completions_proxy_connection(
             &mut stream,
@@ -1097,6 +1264,9 @@ async fn handle_helper_connection(
                 "status": "ok",
                 "message": "后端已连接",
                 "version": crate::version::VERSION,
+                "hideOfficialUsageAlert": crate::assets::hide_official_usage_alert_config(
+                    &crate::settings::SettingsStore::default().load().unwrap_or_default()
+                ),
                 "transport": "http-helper"
             }))?,
             "application/json; charset=utf-8".to_string(),
@@ -1186,6 +1356,30 @@ async fn handle_helper_connection(
     }
     stream.shutdown().await?;
     Ok(())
+}
+
+fn decode_protocol_proxy_request_body(
+    body: &[u8],
+    content_encoding: Option<&str>,
+) -> anyhow::Result<String> {
+    let encoding = content_encoding.unwrap_or_default().trim();
+    let decoded = if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        body.to_vec()
+    } else if encoding.eq_ignore_ascii_case("zstd") {
+        let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
+        let mut limited = decoder.take((MAX_HTTP_BODY_BYTES + 1) as u64);
+        let mut decoded = Vec::new();
+        limited.read_to_end(&mut decoded)?;
+        if decoded.len() > MAX_HTTP_BODY_BYTES {
+            anyhow::bail!("解压后的请求体超过大小限制");
+        }
+        decoded
+    } else {
+        anyhow::bail!("不支持的 Content-Encoding：{encoding}");
+    };
+
+    String::from_utf8(decoded)
+        .map_err(|error| anyhow::anyhow!("Responses 请求体不是 UTF-8：{error}"))
 }
 
 fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
@@ -1376,9 +1570,10 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request(
+    let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path(
         request_body,
         request_user_agent,
+        path,
     )
     .await
     {
@@ -1585,6 +1780,78 @@ async fn handle_audio_transcriptions_proxy_connection(
             "helper.audio_transcriptions_proxy_ok"
         } else {
             "helper.audio_transcriptions_proxy_upstream_error"
+        },
+        method,
+        path,
+        &status,
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn handle_image_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &[u8],
+    request_content_type: Option<&str>,
+    request_user_agent: Option<&str>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let upstream = if crate::protocol_proxy::is_image_generations_proxy_path(path) {
+        crate::protocol_proxy::open_image_generations_proxy_request(
+            request_body,
+            request_user_agent,
+        )
+        .await
+    } else {
+        crate::protocol_proxy::open_image_edits_proxy_request(
+            request_body,
+            request_content_type.unwrap_or_default(),
+            request_user_agent,
+        )
+        .await
+    };
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.image_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let status = upstream.response.status().to_string();
+    let is_success = upstream.response.status().is_success();
+    let content_type = if upstream.content_type.is_empty() {
+        "application/json; charset=utf-8".to_string()
+    } else {
+        upstream.content_type.clone()
+    };
+    let body = upstream.response.bytes().await?.to_vec();
+    write_http_response(stream, &status, &content_type, &body).await?;
+    log_helper_response(
+        if is_success {
+            "helper.image_proxy_ok"
+        } else {
+            "helper.image_proxy_upstream_error"
         },
         method,
         path,
@@ -2261,11 +2528,43 @@ async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()
 }
 
 pub async fn check_and_reinject_bridge(debug_port: u16, helper_port: u16) -> bool {
-    check_and_reinject_bridge_inner(debug_port, helper_port, false, None).await
+    // This one-shot entry point preserves its historical immediate-repair behavior.
+    let mut health_failures = BRIDGE_HEALTH_FAILURE_THRESHOLD.saturating_sub(1);
+    check_and_reinject_bridge_inner(debug_port, helper_port, false, None, &mut health_failures)
+        .await
 }
 
 pub fn browser_identity_changed(previous: Option<&str>, current: &str) -> bool {
     previous.is_some_and(|previous| previous != current)
+}
+
+fn launcher_target_alive(has_codex_process: bool, cdp_available: bool) -> bool {
+    has_codex_process || cdp_available
+}
+
+fn should_probe_launcher_cdp(is_windows: bool, has_codex_process: bool) -> bool {
+    is_windows && !has_codex_process
+}
+
+fn should_reinject_after_health_result(
+    healthy: Option<bool>,
+    browser_identity_changed: bool,
+    health_failures: &mut u8,
+) -> bool {
+    let Some(healthy) = healthy else {
+        *health_failures = 0;
+        return false;
+    };
+    if healthy {
+        *health_failures = 0;
+        return false;
+    }
+    if browser_identity_changed {
+        *health_failures = BRIDGE_HEALTH_FAILURE_THRESHOLD;
+    } else {
+        *health_failures = health_failures.saturating_add(1);
+    }
+    *health_failures >= BRIDGE_HEALTH_FAILURE_THRESHOLD
 }
 
 async fn check_and_reinject_bridge_inner(
@@ -2273,12 +2572,13 @@ async fn check_and_reinject_bridge_inner(
     helper_port: u16,
     browser_identity_changed: bool,
     bridge_reinjector: Option<BridgeReinjector>,
+    health_failures: &mut u8,
 ) -> bool {
     let healthy = if browser_identity_changed {
-        false
+        Some(false)
     } else {
         match bridge_health_ok(debug_port).await {
-            Ok(healthy) => healthy,
+            Ok(healthy) => Some(healthy),
             Err(error) => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "bridge.health_check_failed",
@@ -2288,11 +2588,15 @@ async fn check_and_reinject_bridge_inner(
                         "message": error.to_string()
                     }),
                 );
-                false
+                // A CDP timeout only means that the renderer did not answer
+                // this probe in time. The bridge heartbeat is the source of
+                // truth for actual availability; do not reinject on an
+                // indeterminate CDP result or a busy page will cause churn.
+                None
             }
         }
     };
-    if healthy {
+    if !should_reinject_after_health_result(healthy, browser_identity_changed, health_failures) {
         return false;
     }
 
@@ -2301,7 +2605,8 @@ async fn check_and_reinject_bridge_inner(
         serde_json::json!({
             "debug_port": debug_port,
             "helper_port": helper_port,
-            "browser_identity_changed": browser_identity_changed
+            "browser_identity_changed": browser_identity_changed,
+            "consecutive_health_failures": *health_failures
         }),
     );
     let default_reinjector: BridgeReinjector =
@@ -2316,6 +2621,7 @@ async fn check_and_reinject_bridge_inner(
                     "helper_port": helper_port
                 }),
             );
+            *health_failures = 0;
             true
         }
         Err(error) => {
@@ -2652,6 +2958,17 @@ pub fn build_macos_cleanup_command(
     ])
 }
 
+pub fn select_macos_debug_launch_action(
+    app_running: bool,
+    codex_cdp_available: bool,
+) -> MacosDebugLaunchAction {
+    match (app_running, codex_cdp_available) {
+        (false, _) => MacosDebugLaunchAction::LaunchNew,
+        (true, true) => MacosDebugLaunchAction::ReuseRunningDebugApp,
+        (true, false) => MacosDebugLaunchAction::RestartRunningApp,
+    }
+}
+
 async fn run_macos_cleanup_command(
     app_dir: &Path,
     policy: MacosCleanupPolicy,
@@ -2669,6 +2986,31 @@ async fn run_macos_cleanup_command(
         .status()
         .await
         .with_context(|| format!("failed to request macOS app quit for {}", app_dir.display()))?;
+    Ok(())
+}
+
+async fn quit_macos_app_and_wait(app_dir: &Path) -> anyhow::Result<()> {
+    run_macos_cleanup_command(app_dir, MacosCleanupPolicy::QuitIfNotPreviouslyRunning).await?;
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(MACOS_DEBUG_TAKEOVER_WAIT_MS);
+    while is_macos_app_running(app_dir).await {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "macOS app did not exit before debug relaunch: {}",
+                app_dir.display()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            MACOS_DEBUG_TAKEOVER_INTERVAL_MS,
+        ))
+        .await;
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.macos_existing_app_without_cdp_stopped",
+        serde_json::json!({
+            "app_dir": app_dir
+        }),
+    );
     Ok(())
 }
 
@@ -2703,119 +3045,6 @@ async fn is_macos_app_running(app_dir: &Path) -> bool {
         && String::from_utf8_lossy(&output.stdout)
             .trim()
             .eq_ignore_ascii_case("true")
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn post_launch_guard_artifacts_ready(
-    artifacts: &crate::computer_use_guard::GuardArtifacts,
-) -> bool {
-    artifacts.notify_exe.is_some()
-        && artifacts.marketplace_path.is_some()
-        && (!artifacts.runtime_exports_needed || artifacts.sky_package_json.is_some())
-}
-
-#[cfg_attr(not(windows), allow(dead_code))]
-fn should_stop_post_launch_computer_use_guard(
-    stable_unchanged_attempts: usize,
-    artifacts: &crate::computer_use_guard::GuardArtifacts,
-) -> bool {
-    stable_unchanged_attempts >= POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS
-        && post_launch_guard_artifacts_ready(artifacts)
-}
-
-#[cfg(windows)]
-async fn run_post_launch_computer_use_guard(
-    home: PathBuf,
-    mut artifacts: Option<crate::computer_use_guard::GuardArtifacts>,
-    shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
-) {
-    let mut previous_delay = 0_u64;
-    let mut stable_unchanged_attempts = 0_usize;
-    for (index, delay) in POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS
-        .iter()
-        .copied()
-        .enumerate()
-    {
-        let wait_seconds = delay.saturating_sub(previous_delay);
-        previous_delay = delay;
-        if wait_seconds > 0 {
-            tokio::select! {
-                _ = &mut *shutdown_rx => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)) => {}
-            }
-        }
-        let attempt = index + 1;
-        let resolved_artifacts = match artifacts.take() {
-            Some(artifacts) => artifacts,
-            None => match crate::computer_use_guard::resolve_computer_use_guard_artifacts(&home) {
-                Ok(resolved) => resolved,
-                Err(error) => {
-                    stable_unchanged_attempts = 0;
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "computer_use_guard.post_launch_failed",
-                        serde_json::json!({
-                            "attempt": attempt,
-                            "delay_seconds": delay,
-                            "phase": "resolve_artifacts",
-                            "message": error.to_string()
-                        }),
-                    );
-                    continue;
-                }
-            },
-        };
-        let artifacts_ready = post_launch_guard_artifacts_ready(&resolved_artifacts);
-        artifacts = artifacts_ready.then_some(resolved_artifacts.clone());
-        match crate::computer_use_guard::ensure_computer_use_config_with_artifacts(
-            &home,
-            &resolved_artifacts,
-        ) {
-            Ok(result) => {
-                if !result.changed && artifacts_ready {
-                    stable_unchanged_attempts += 1;
-                } else {
-                    stable_unchanged_attempts = 0;
-                }
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "computer_use_guard.post_launch_ok",
-                    serde_json::json!({
-                        "attempt": attempt,
-                        "delay_seconds": delay,
-                        "changed": result.changed,
-                        "stable_unchanged_attempts": stable_unchanged_attempts,
-                        "notify_exe": result
-                            .notify_exe
-                            .map(|path| path.to_string_lossy().to_string())
-                    }),
-                );
-                if should_stop_post_launch_computer_use_guard(
-                    stable_unchanged_attempts,
-                    &resolved_artifacts,
-                ) {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "computer_use_guard.post_launch_stable_stop",
-                        serde_json::json!({
-                            "attempt": attempt,
-                            "delay_seconds": delay,
-                            "stable_unchanged_attempts": stable_unchanged_attempts
-                        }),
-                    );
-                    return;
-                }
-            }
-            Err(error) => {
-                stable_unchanged_attempts = 0;
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "computer_use_guard.post_launch_failed",
-                    serde_json::json!({
-                        "attempt": attempt,
-                        "delay_seconds": delay,
-                        "message": error.to_string()
-                    }),
-                );
-            }
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -2970,8 +3199,7 @@ pub async fn activate_packaged_app(
 #[cfg(windows)]
 fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
     use windows::Win32::System::Com::{
-        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize,
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
     };
     use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
     use windows::core::HSTRING;
@@ -2990,7 +3218,7 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 
         let result: windows::core::Result<u32> = (|| {
             let manager: IApplicationActivationManager =
-                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?;
             let process_id = manager.ActivateApplication(
                 &HSTRING::from(app_user_model_id),
                 &HSTRING::from(arguments),
@@ -3019,6 +3247,67 @@ mod tests {
                 Ok(())
             })
         })
+    }
+
+    #[test]
+    fn launcher_stays_alive_while_injected_cdp_endpoint_is_available() {
+        assert!(launcher_target_alive(false, true));
+    }
+
+    #[test]
+    fn launcher_only_probes_cdp_for_unrecognized_windows_processes() {
+        assert!(should_probe_launcher_cdp(true, false));
+        assert!(!should_probe_launcher_cdp(true, true));
+        assert!(!should_probe_launcher_cdp(false, false));
+    }
+
+    #[test]
+    fn bridge_health_failures_reinject_only_after_consecutive_unhealthy_results() {
+        let mut failures = 0;
+        assert!(!should_reinject_after_health_result(
+            Some(false),
+            false,
+            &mut failures
+        ));
+        assert_eq!(failures, 1);
+        assert!(should_reinject_after_health_result(
+            Some(false),
+            false,
+            &mut failures
+        ));
+        assert_eq!(failures, BRIDGE_HEALTH_FAILURE_THRESHOLD);
+        assert!(!should_reinject_after_health_result(
+            Some(true),
+            false,
+            &mut failures
+        ));
+        assert_eq!(failures, 0);
+
+        failures = 1;
+        assert!(!should_reinject_after_health_result(
+            None,
+            false,
+            &mut failures
+        ));
+        assert_eq!(failures, 0);
+        assert!(should_reinject_after_health_result(
+            Some(false),
+            true,
+            &mut failures
+        ));
+    }
+
+    #[test]
+    fn helper_bind_retry_covers_fixed_proxy_ports_and_macos_restarts() {
+        assert_eq!(
+            helper_bind_retry_timeout_ms(true, false),
+            HELPER_BIND_RETRY_TIMEOUT_MS
+        );
+        assert_eq!(
+            helper_bind_retry_timeout_ms(false, true),
+            HELPER_BIND_RETRY_TIMEOUT_MS
+        );
+        assert_eq!(helper_bind_retry_timeout_ms(false, false), 0);
     }
 
     #[tokio::test]
@@ -3159,6 +3448,193 @@ mod tests {
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
     }
 
+    #[tokio::test]
+    async fn helper_returns_426_for_responses_websocket_upgrade() {
+        let response = send_raw_helper_request(
+            b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 426 Upgrade Required"));
+    }
+
+    #[tokio::test]
+    async fn helper_keeps_unknown_image_path_as_not_found() {
+        let response = send_raw_helper_request(
+            b"POST /v1/images/unknown HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await;
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(response.contains("未知后端路径"));
+    }
+
+    #[tokio::test]
+    async fn helper_proxies_image_generation_upstream_error_response() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfiles": [{
+                "id": "images",
+                "name": "Images",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-test",
+                "protocol": "responses",
+                "relayMode": "mixedApi"
+            }],
+            "activeRelayId": "images"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = br#"{"error":{"message":"rate limited"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            request
+        });
+        let request_body = br#"{"model":"gpt-image-2","prompt":"draw a square"}"#;
+        let headers = format!(
+            "POST /v1/images/generations HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            request_body.len()
+        );
+        let mut request = headers.into_bytes();
+        request.extend_from_slice(request_body);
+
+        let response = send_raw_helper_request(&request).await;
+
+        let response_text = String::from_utf8_lossy(&response);
+        assert!(response_text.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(response_text.contains("Content-Type: application/problem+json"));
+        assert!(response.ends_with(br#"{"error":{"message":"rate limited"}}"#));
+        let upstream_request = upstream.await.unwrap();
+        let request_line = String::from_utf8_lossy(&upstream_request.headers);
+        assert!(request_line.starts_with("POST /v1/images/generations HTTP/1.1"));
+        assert_eq!(upstream_request.body, request_body);
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[test]
+    fn protocol_proxy_request_body_decodes_zstd() {
+        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
+
+        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
+
+        assert_eq!(decoded.as_bytes(), body);
+        assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
+    }
+
+    #[tokio::test]
+    async fn helper_replaces_chatgpt_auth_when_proxying_zstd_responses_request() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfilesEnabled": true,
+            "relayProfiles": [{
+                "id": "remote-control",
+                "name": "Remote Control Relay",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-upstream",
+                "protocol": "responses",
+                "relayMode": "official",
+                "officialMixApiKey": true
+            }],
+            "activeRelayId": "remote-control"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "upstream request ended before body completed");
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = find_header_end(&request) {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let response_body = br#"{"id":"resp_remote","object":"response"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(response_body).await.unwrap();
+            request
+        });
+
+        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            compressed.len()
+        );
+        client.write_all(headers.as_bytes()).await.unwrap();
+        client.write_all(&compressed).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+
+        helper.await.unwrap();
+        let upstream_request = upstream.await.unwrap();
+        let header_end = find_header_end(&upstream_request).unwrap();
+        let upstream_headers =
+            String::from_utf8_lossy(&upstream_request[..header_end]).to_ascii_lowercase();
+        assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
+        assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
+        assert!(!upstream_headers.contains("chatgpt-secret"));
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
+        assert_eq!(upstream_body["model"], "gpt-5.6-sol");
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -3277,53 +3753,5 @@ mod tests {
         helper.await.unwrap();
         assert_eq!(upstream.await.unwrap(), expected_body);
         crate::paths::set_settings_path_for_tests(previous_settings_path);
-    }
-
-    #[test]
-    fn post_launch_guard_stops_after_stable_ready_artifacts() {
-        let artifacts = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
-            marketplace_path: Some(PathBuf::from("openai-bundled")),
-            sky_package_json: None,
-            runtime_exports_needed: false,
-        };
-
-        assert!(!should_stop_post_launch_computer_use_guard(2, &artifacts));
-        assert!(should_stop_post_launch_computer_use_guard(3, &artifacts));
-    }
-
-    #[test]
-    fn post_launch_guard_keeps_retrying_until_artifacts_are_ready() {
-        let missing_notify = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: None,
-            marketplace_path: Some(PathBuf::from("openai-bundled")),
-            sky_package_json: None,
-            runtime_exports_needed: false,
-        };
-        let missing_marketplace = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
-            marketplace_path: None,
-            sky_package_json: None,
-            runtime_exports_needed: false,
-        };
-        let missing_runtime_package = crate::computer_use_guard::GuardArtifacts {
-            notify_exe: Some(PathBuf::from("codex-computer-use.exe")),
-            marketplace_path: Some(PathBuf::from("openai-bundled")),
-            sky_package_json: None,
-            runtime_exports_needed: true,
-        };
-
-        assert!(!should_stop_post_launch_computer_use_guard(
-            3,
-            &missing_notify
-        ));
-        assert!(!should_stop_post_launch_computer_use_guard(
-            3,
-            &missing_marketplace
-        ));
-        assert!(!should_stop_post_launch_computer_use_guard(
-            3,
-            &missing_runtime_package
-        ));
     }
 }

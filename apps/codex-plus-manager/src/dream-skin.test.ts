@@ -102,17 +102,47 @@ describe("dream skin theme helpers", () => {
     assert.match(renderer, /ensureDreamSkinCompanion\(\s*window\.__CODEX_PLUS_DREAM_SKIN_THEME__/);
   });
 
-  it("keeps the Windows skin active when the sidebar is hidden", async () => {
+  it("aligns tall companion images by rendered height with a wider vertical offset range", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
+
+    assert.match(renderer, /companion\.naturalWidth/);
+    assert.match(renderer, /companion\.naturalHeight/);
+    assert.match(renderer, /composer\.rect\.bottom - renderedHeight \+ config\.offsetY/);
+    assert.match(renderer, /window\.innerHeight - renderedHeight - edge/);
+    assert.match(renderer, /const offsetY = Math\.max\(-160, Math\.min\(Number\(companion\.offsetY\) \|\| 0, 160\)\)/);
+    assert.match(app, /min=\{-160\}/);
+    assert.match(app, /max=\{160\}/);
+    assert.match(app, /Math\.max\(-160, Math\.min\(160, Number\(event\.currentTarget\.value\) \|\| 0\)\)/);
+  });
+
+  it("uses the current shared selector contract without requiring a visible sidebar", async () => {
     const renderer = await readFile(
       new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
       "utf8",
     );
+    const compatibility = await readFile(
+      new URL("../../../assets/inject/renderer-inject.js", import.meta.url),
+      "utf8",
+    );
+    const assets = await readFile(
+      new URL("../../../crates/codex-plus-core/src/assets.rs", import.meta.url),
+      "utf8",
+    );
 
-    assert.match(renderer, /const shellMain = document\.querySelector\("main\.main-surface"\)/);
-    assert.doesNotMatch(renderer, /!shellMain\s*\|\|\s*!shellSidebar/);
+    assert.match(renderer, /codex-dream-skin-selectors\/1/);
+    assert.match(renderer, /data-app-shell-main-surface/);
+    assert.match(renderer, /_MainContentSurface_/);
+    assert.match(renderer, /data-ds-part/);
+    assert.match(renderer, /MutationObserver/);
+    assert.match(compatibility, /main\[class\*="_MainContentSurface_"\]/);
+    assert.match(compatibility, /shellMain\.classList\.add\("main-surface"\)/);
+    assert.match(compatibility, /data-codex-plus-dream-skin-main-surface/);
+    assert.match(compatibility, /clearDreamSkinMainSurfaceCompatibility\(\)/);
+    assert.match(assets, /DREAM_SKIN_RENDERER_REVISION: &str = "24-home-composer-rounded"/);
   });
 
-  it("extends the Windows wallpaper treatment to right and bottom dock panels", async () => {
+  it("covers the current shell, composer, message, and top-fade contracts", async () => {
     const renderer = await readFile(
       new URL("../../../assets/inject/upstream/dream-skin/windows/renderer-inject.js", import.meta.url),
       "utf8",
@@ -122,15 +152,16 @@ describe("dream skin theme helpers", () => {
       "utf8",
     );
 
-    assert.match(renderer, /\[data-app-shell-tabs="true"\]/);
-    assert.match(renderer, /dream-aux-panel-layer/);
-    assert.match(renderer, /dream-aux-panel-right/);
-    assert.match(renderer, /dream-aux-panel-bottom/);
-    assert.match(renderer, /clearAuxiliaryPanelClasses/);
-    assert.match(css, /\.dream-aux-panel-layer/);
-    assert.match(css, /\.dream-aux-panel-right/);
-    assert.match(css, /\.dream-aux-panel-bottom/);
-    assert.match(css, /\[data-codex-terminal="true"\]/);
+    assert.match(renderer, /_ComposerLayoutRoot_/);
+    assert.match(renderer, /data-local-conversation-final-assistant/);
+    assert.match(renderer, /data-local-conversation-user-anchor/);
+    assert.match(css, /_MainContentTopFade_/);
+    assert.match(css, /_ComposerLayoutBody_/);
+    assert.match(css, /data-markdown-table="true"/);
+    assert.match(css, /_Toolbar_.*> \*/s);
+    assert.match(css, /data-composer-home-utility-bar-position="above"[\s\S]*box-sizing:\s*border-box/);
+    assert.match(css, /_StickyActionBar_/);
+    assert.match(css, /data-ds-part="home"[\s\S]*overflow:\s*hidden\s*!important/);
   });
 
   it("exposes companion image controls in the theme editor", async () => {
