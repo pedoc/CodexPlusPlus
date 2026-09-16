@@ -170,6 +170,7 @@ ln -s /Applications "$STAGE/Applications"
 DMG_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-plus-plus-dmg.XXXXXX")"
 DMG_WORK_PATH="$DMG_WORK_DIR/$(basename "$DMG")"
 DMG_CREATED=false
+FINAL_DMG_CREATED=false
 MOUNT_POINT=""
 MOUNT_DEVICE=""
 
@@ -304,7 +305,7 @@ MOUNT_DEVICE=""
 # convert 会暂时报 Resource temporarily unavailable——退避重试等它完成。
 for attempt in 1 2 3 4 5; do
   if hdiutil convert "$DMG_WORK_PATH" -format UDZO -ov -o "$DMG"; then
-    DMG_CREATED=true
+    FINAL_DMG_CREATED=true
     break
   fi
 
@@ -313,8 +314,8 @@ for attempt in 1 2 3 4 5; do
   fi
 done
 
-if [ "$DMG_CREATED" != true ]; then
-  echo "error: failed to create DMG after 5 attempts" >&2
+if [ "$FINAL_DMG_CREATED" != true ] || [ ! -s "$DMG" ]; then
+  echo "error: failed to create final DMG after 5 attempts: $DMG" >&2
   exit 1
 fi
 

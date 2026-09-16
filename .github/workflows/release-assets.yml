@@ -157,6 +157,13 @@ jobs:
           VERSION="${VERSION#V}"
           BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
 
+      - name: Verify macOS DMG asset
+        shell: bash
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          VERSION="${VERSION#V}"
+          test -s "dist/macos/CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.dmg"
+
       - name: Build macOS zip asset
         shell: bash
         run: |
