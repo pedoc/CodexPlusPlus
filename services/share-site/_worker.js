@@ -53,9 +53,27 @@ async function createShare(request, env) {
 
   let body;
   try {
-    const rawBody = await request.arrayBuffer();
-    if (rawBody.byteLength > MAX_BODY_BYTES) {
-      return json({ error: "Share is too large" }, 413);
+    const reader = request.body?.getReader();
+    if (!reader) {
+      return json({ error: "Invalid JSON" }, 400);
+    }
+    const chunks = [];
+    let totalBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > MAX_BODY_BYTES) {
+        await reader.cancel();
+        return json({ error: "Share is too large" }, 413);
+      }
+      chunks.push(value);
+    }
+    const rawBody = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      rawBody.set(chunk, offset);
+      offset += chunk.byteLength;
     }
     body = JSON.parse(new TextDecoder().decode(rawBody));
   } catch {
