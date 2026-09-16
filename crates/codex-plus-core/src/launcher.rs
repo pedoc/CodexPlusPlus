@@ -611,6 +611,13 @@ impl DefaultLaunchHooks {
     }
 }
 
+fn helper_origin_allowed(origin: &str) -> bool {
+    matches!(
+        origin.trim(),
+        "app://-" | "app://-/" | "http://tauri.localhost" | "https://tauri.localhost"
+    )
+}
+
 fn helper_bind_host() -> String {
     let requested = std::env::var("CODEX_PLUS_HELPER_BIND")
         .ok()
@@ -1124,10 +1131,30 @@ async fn handle_helper_connection(
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
+    let request_origin = header_value_from_headers(&request_headers, "origin");
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
     let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
+
+    if request_origin
+        .as_deref()
+        .is_some_and(|origin| !helper_origin_allowed(origin))
+    {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "failed",
+            "message": "helper origin not allowed"
+        }))?;
+        write_http_response(
+            &mut stream,
+            "403 Forbidden",
+            "application/json; charset=utf-8",
+            &body,
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "helper.request",
@@ -3305,6 +3332,13 @@ mod tests {
             true,
             &mut failures
         ));
+    }
+
+    #[test]
+    fn helper_origin_allowlist_rejects_untrusted_websites() {
+        assert!(helper_origin_allowed("app://-/"));
+        assert!(helper_origin_allowed("http://tauri.localhost"));
+        assert!(!helper_origin_allowed("https://evil.example"));
     }
 
     #[test]

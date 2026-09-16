@@ -3,6 +3,7 @@ const MAX_CIPHERTEXT_LENGTH = 22_500_000;
 const ALLOWED_TTLS = new Set([86_400, 604_800, 2_592_000]);
 const RATE_LIMIT_WINDOW_SECONDS = 60;
 const MAX_CREATES_PER_WINDOW = 30;
+const localRateBuckets = new Map();
 
 export default {
   async fetch(request, env) {
@@ -157,8 +158,21 @@ async function deleteShare(request, id, env) {
   return new Response(null, { status: 204, headers: corsHeaders() });
 }
 
+function isLocalRateLimited(clientId) {
+  const window = Math.floor(Date.now() / (RATE_LIMIT_WINDOW_SECONDS * 1000));
+  for (const key of localRateBuckets.keys()) {
+    if (!key.endsWith(`:${window}`)) localRateBuckets.delete(key);
+  }
+  const key = `${clientId}:${window}`;
+  const current = localRateBuckets.get(key) || 0;
+  if (current >= MAX_CREATES_PER_WINDOW) return true;
+  localRateBuckets.set(key, current + 1);
+  return false;
+}
+
 async function isCreateRateLimited(request, env) {
   const clientId = request.headers.get("CF-Connecting-IP") || "unknown";
+  if (isLocalRateLimited(clientId)) return true;
   const window = Math.floor(Date.now() / (RATE_LIMIT_WINDOW_SECONDS * 1000));
   const key = `rate:${window}:${await sha256(clientId)}`;
   const current = Number(await env.SHARES.get(key) || 0);
