@@ -1,5 +1,5 @@
 const repository = "pedoc/CodexPlusPlus";
-const fallbackVersion = "1.3.1";
+const fallbackVersion = "1.3.2";
 
 const translations = {
   "跳到主要内容": "Skip to main content",
