@@ -100,101 +100,10 @@ jobs:
             dist/windows/*.exe
             dist/windows/*.zip
 
-  macos-dmg:
-    name: macOS DMG (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - arch: arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
-    steps:
-      - name: Validate release tag
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ env.RELEASE_TAG }}
-        run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release tag: $RELEASE_TAG" >&2
-            exit 1
-          fi
-
-      - name: Checkout release tag
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-          persist-credentials: false
-
-      - name: Setup Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: "22"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
-
-      - name: Build frontend
-        working-directory: apps/codex-plus-manager
-        run: npm run vite:build
-
-      - name: Build binaries
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build macOS DMG
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          VERSION="${VERSION#V}"
-          BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
-
-      - name: Verify macOS DMG asset
-        shell: bash
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          VERSION="${VERSION#V}"
-          test -s "dist/macos/CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.dmg"
-
-      - name: Build macOS zip asset
-        shell: bash
-        run: |
-          VERSION="${RELEASE_TAG#v}"
-          VERSION="${VERSION#V}"
-          mkdir -p dist/macos/app-${{ matrix.arch }}
-          cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
-          cp "target/${{ matrix.target }}/release/codex-plus-plus-manager" "dist/macos/app-${{ matrix.arch }}/"
-          (cd dist/macos && zip -r "CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.zip" "app-${{ matrix.arch }}")
-
-      - name: Verify macOS bundle structure
-        run: |
-          set -euo pipefail
-          test -L "dist/macos/stage/Applications"
-          test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
-          for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
-            test -f "$app/Contents/Info.plist"
-            test -f "$app/Contents/PkgInfo"
-            test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
-            plutil -lint "$app/Contents/Info.plist" >/dev/null
-            codesign -dv "$app" >/dev/null 2>&1
-            echo "verified: $app"
-          done
-
-      - name: Upload macOS DMG
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          files: |
-            dist/macos/*.dmg
-            dist/macos/*.zip
+  # macOS DMG builds are disabled in this fork.
+  # macrosoft-dmg:
+  #   name: macOS DMG (${{ matrix.arch }})
+  #   ...
 
   latest-json:
     name: Upload static latest.json

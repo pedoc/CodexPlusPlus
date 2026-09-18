@@ -90,6 +90,7 @@ jobs:
   macos-dmg:
     name: macOS DMG (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    if: false # macOS DMG builds disabled in this fork
     strategy:
       fail-fast: false
       matrix:
