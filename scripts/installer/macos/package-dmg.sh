@@ -305,7 +305,7 @@ for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
 done
 
 if [ "$FINAL_DMG_CREATED" != true ]; then
-  echo "error: failed to create final DMG after 12 attempts" >&2
+  echo "error: failed to create DMG after 12 attempts" >&2
   exit 1
 fi
 
